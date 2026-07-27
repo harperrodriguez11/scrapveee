@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       list_url:
-        description: 'Main list URL to scrape from (e.g. https://www.foodies.com/foods/ or any other page)'
+        description: 'Main list URL to scrape from (e.g. https://www.foodies.com/foods/ or https://foodies.com/food/)'
         required: true
         default: 'https://www.foodies.com/foods/'
         type: string
@@ -22,7 +22,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -36,7 +36,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 pandas openpyxl lxml
+          pip install playwright pandas openpyxl beautifulsoup4 lxml
+          playwright install chromium --with-deps
 
       - name: Scrape profiles and generate XLSX
         env:
@@ -47,176 +48,212 @@ jobs:
           python << 'PYEOF'
           import os
           import time
-          import requests
+          import re
+          from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
+          from playwright.sync_api import sync_playwright
           from bs4 import BeautifulSoup
           import pandas as pd
-          from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
 
           LIST_URL = os.environ.get("LIST_URL", "https://www.foodies.com/foods/").strip()
-          if not LIST_URL.endswith("/") and "?" not in LIST_URL:
-              LIST_URL = LIST_URL + "/"
-          # Derive site origin for absolute image URLs
-          parsed = urlparse(LIST_URL)
-          BASE_URL = f"{parsed.scheme}://{parsed.netloc}"
           MAX_PROFILES = int(os.environ.get("MAX_PROFILES", "50"))
           START_PAGE = int(os.environ.get("START_PAGE", "1"))
 
-          headers = {
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-              "Accept-Language": "en-US,en;q=0.5",
-          }
+          parsed = urlparse(LIST_URL)
+          BASE_URL = f"{parsed.scheme}://{parsed.netloc}"
 
-          session = requests.Session()
-          session.headers.update(headers)
-
-          profiles = []
-          page = START_PAGE
-          seen = set()
-
-          def build_page_url(base, page_num):
-              """Build paginated URL from any starting list URL."""
-              if page_num <= 1:
-                  # Keep original URL clean for page 1
-                  p = urlparse(base)
-                  qs = parse_qs(p.query)
-                  qs.pop("page", None)
-                  new_query = urlencode(qs, doseq=True)
-                  return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+          def build_page_url(base: str, page_num: int) -> str:
               p = urlparse(base)
               qs = parse_qs(p.query)
-              qs["page"] = [str(page_num)]
+              if page_num <= 1:
+                  qs.pop("page", None)
+              else:
+                  qs["page"] = [str(page_num)]
               new_query = urlencode(qs, doseq=True)
-              return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+              return urlunparse((p.scheme, p.netloc, p.path or "/", p.params, new_query, p.fragment))
+
+          profiles = []
+          seen = set()
+          page = START_PAGE
 
           print(f"Starting scrape from: {LIST_URL}")
           print(f"max={MAX_PROFILES}, start_page={START_PAGE}")
 
-          while len(profiles) < MAX_PROFILES:
-              url = build_page_url(LIST_URL, page)
+          with sync_playwright() as p:
+              browser = p.chromium.launch(
+                  headless=True,
+                  args=[
+                      "--disable-blink-features=AutomationControlled",
+                      "--no-sandbox",
+                      "--disable-dev-shm-usage",
+                  ],
+              )
+              context = browser.new_context(
+                  user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                  viewport={"width": 1280, "height": 900},
+                  locale="en-US",
+              )
+              # Hide webdriver flag
+              context.add_init_script("""
+                  Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+              """)
+              page_obj = context.new_page()
 
-              print(f"Fetching page {page}: {url}")
-              try:
-                  resp = session.get(url, timeout=30)
-                  resp.raise_for_status()
-              except Exception as e:
-                  print(f"Error fetching page {page}: {e}")
-                  break
+              while len(profiles) < MAX_PROFILES:
+                  url = build_page_url(LIST_URL, page)
+                  print(f"Fetching page {page}: {url}")
 
-              soup = BeautifulSoup(resp.text, "lxml")
-
-              # --- ADJUST SELECTORS TO MATCH ACTUAL SITE STRUCTURE ---
-              # Based on provided HTML hints: cards containing card-title, images, about text
-              # Common patterns: look for profile cards
-              cards = soup.select("div.card, article.profile, div.profile-card, .food-card, [class*='card']")
-              if not cards:
-                  # Fallback: any element that looks like a profile card
-                  cards = soup.find_all("div", class_=lambda c: c and ("card" in c.lower() or "profile" in c.lower()))
-
-              print(f"  Found {len(cards)} potential cards on page {page}")
-
-              if not cards:
-                  # Check for next page existence
-                  paginator = soup.select_one("div.paginator")
-                  if not paginator or not paginator.select_one("a.next, a[href*='page=']"):
-                      print("No more cards and no next page. Stopping.")
+                  try:
+                      page_obj.goto(url, wait_until="domcontentloaded", timeout=60000)
+                      # Extra wait for any JS-rendered cards
+                      page_obj.wait_for_timeout(2500)
+                      # Scroll a bit in case of lazy load
+                      page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                      page_obj.wait_for_timeout(1000)
+                      page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                      page_obj.wait_for_timeout(1500)
+                  except Exception as e:
+                      print(f"Error loading page {page}: {e}")
                       break
-                  page += 1
-                  time.sleep(1.5)
-                  continue
 
-              new_on_page = 0
-              for card in cards:
-                  if len(profiles) >= MAX_PROFILES:
-                      break
+                  html = page_obj.content()
+                  soup = BeautifulSoup(html, "lxml")
 
-                  # Image URL - full absolute path
-                  img = card.select_one("img")
-                  image_url = ""
-                  if img:
-                      src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or ""
-                      if src:
-                          image_url = urljoin(BASE_URL, src)
-
-                  # Full name - try common places (title, h2/h3, .name, .card-title text)
-                  full_name = ""
-                  name_el = (
-                      card.select_one(".card-title")
-                      or card.select_one("h2, h3, h4")
-                      or card.select_one(".name, .fullname-name, .profile-name, [class*='name']")
-                      or card.select_one("a[href*='/']")
+                  # Try multiple common card selectors
+                  cards = (
+                      soup.select("div.card")
+                      or soup.select("article.profile, div.profile-card, .food-card")
+                      or soup.select("[class*='card']")
+                      or soup.select("[class*='profile']")
                   )
-                  if name_el:
-                      full_name = name_el.get_text(strip=True)
 
-                  # About text - user said: trim not include <div class="card-title"></div>
-                  # Only the profile about text like "Hello I am chef I give you recipe"
-                  about = ""
-                  # Prefer a dedicated about / bio / description element
-                  about_el = (
-                      card.select_one(".about, .bio, .description, .card-body, .profile-about, [class*='about'], [class*='bio']")
-                      or card.select_one("p")
-                  )
-                  if about_el:
-                      # Get text, excluding any nested card-title if present
-                      for title in about_el.select(".card-title"):
-                          title.decompose()
-                      about = about_el.get_text(" ", strip=True)
-                  else:
-                      # Fallback: collect text from card excluding title
-                      clone = BeautifulSoup(str(card), "lxml")
-                      for t in clone.select(".card-title"):
-                          t.decompose()
-                      about = clone.get_text(" ", strip=True)
-                      # Clean up common noise
-                      if full_name and about.startswith(full_name):
-                          about = about[len(full_name):].strip()
+                  # Broader fallback if still empty
+                  if not cards:
+                      cards = soup.find_all("div", class_=lambda c: c and ("card" in str(c).lower() or "profile" in str(c).lower()))
 
-                  # Skip empty or duplicate
-                  key = (image_url, full_name)
-                  if not full_name and not image_url:
-                      continue
-                  if key in seen:
-                      continue
-                  seen.add(key)
+                  print(f"  Found {len(cards)} potential cards on page {page}")
 
-                  profiles.append({
-                      "image_url": image_url,
-                      "full_name": full_name,
-                      "about": about,
-                  })
-                  new_on_page += 1
-
-              print(f"  Added {new_on_page} new profiles (total: {len(profiles)})")
-
-              # Check if next page exists
-              next_link = soup.select_one("div.paginator a.next, a.next.pill, a[aria-label='Next page']")
-              if not next_link or "page=" not in (next_link.get("href") or ""):
-                  # Also check highest page number
-                  page_links = soup.select("div.paginator a.pill[href*='page=']")
-                  if page_links:
-                      max_p = max(
-                          (int(a["href"].split("page=")[-1].split("&")[0]) for a in page_links if "page=" in a.get("href", "")),
-                          default=page
-                      )
-                      if page >= max_p:
-                          print("Reached last page.")
+                  if not cards:
+                      # Debug: print a bit of page title / body length
+                      title = soup.title.string if soup.title else "(no title)"
+                      print(f"  Page title: {title}")
+                      print(f"  Body length: {len(html)}")
+                      # Check paginator existence
+                      paginator = soup.select_one("div.paginator")
+                      if not paginator:
+                          print("  No cards and no paginator found. Stopping.")
                           break
+                      page += 1
+                      continue
+
+                  new_on_page = 0
+                  for card in cards:
+                      if len(profiles) >= MAX_PROFILES:
+                          break
+
+                      # --- Image (full absolute URL) ---
+                      img = card.select_one("img")
+                      image_url = ""
+                      if img:
+                          src = (
+                              img.get("src")
+                              or img.get("data-src")
+                              or img.get("data-lazy-src")
+                              or img.get("data-original")
+                              or ""
+                          )
+                          if src and not src.startswith("data:"):
+                              image_url = urljoin(BASE_URL, src)
+
+                      # --- Full name ---
+                      full_name = ""
+                      name_el = (
+                          card.select_one(".card-title")
+                          or card.select_one("h1, h2, h3, h4")
+                          or card.select_one(".name, .fullname-name, .profile-name, [class*='name']")
+                          or card.select_one("a[href*='/']")
+                      )
+                      if name_el:
+                          full_name = name_el.get_text(strip=True)
+
+                      # --- About (exclude .card-title content) ---
+                      about = ""
+                      about_el = (
+                          card.select_one(".about, .bio, .description, .card-body, .profile-about, [class*='about'], [class*='bio']")
+                          or card.select_one("p")
+                      )
+                      if about_el:
+                          # Remove any nested card-title
+                          for t in about_el.select(".card-title"):
+                              t.decompose()
+                          about = about_el.get_text(" ", strip=True)
+                      else:
+                          # Fallback: whole card text minus title
+                          clone = BeautifulSoup(str(card), "lxml")
+                          for t in clone.select(".card-title"):
+                              t.decompose()
+                          about = clone.get_text(" ", strip=True)
+                          if full_name and about.startswith(full_name):
+                              about = about[len(full_name):].strip()
+
+                      # Clean noisy about text a bit
+                      about = re.sub(r"\s+", " ", about).strip()
+
+                      key = (image_url, full_name)
+                      if not full_name and not image_url:
+                          continue
+                      if key in seen:
+                          continue
+                      seen.add(key)
+
+                      profiles.append({
+                          "image_url": image_url,
+                          "full_name": full_name,
+                          "about": about,
+                      })
+                      new_on_page += 1
+
+                  print(f"  Added {new_on_page} new profiles (total: {len(profiles)})")
+
+                  # Pagination check
+                  next_link = soup.select_one(
+                      "div.paginator a.next, a.next.pill, a[aria-label='Next page'], a[title='Next page']"
+                  )
+                  has_next = False
+                  if next_link and next_link.get("href"):
+                      has_next = True
                   else:
-                      print("No next page link found. Stopping.")
+                      # Check highest page number in paginator
+                      page_links = soup.select("div.paginator a.pill[href*='page='], a[href*='page=']")
+                      if page_links:
+                          try:
+                              max_p = max(
+                                  int(re.search(r"page=(\d+)", a.get("href", "")).group(1))
+                                  for a in page_links
+                                  if re.search(r"page=(\d+)", a.get("href", ""))
+                              )
+                              if page < max_p:
+                                  has_next = True
+                          except Exception:
+                              pass
+
+                  if not has_next:
+                      print("No more pages. Stopping.")
                       break
 
-              page += 1
-              time.sleep(1.5)  # Be polite
+                  page += 1
+                  time.sleep(1.2)
+
+              browser.close()
 
           print(f"\nScraped {len(profiles)} profiles total.")
 
-          # Create DataFrame and save XLSX
           df = pd.DataFrame(profiles, columns=["image_url", "full_name", "about"])
-          output_path = "foodies_profiles.xlsx"
-          df.to_excel(output_path, index=False, engine="openpyxl")
-          print(f"Saved to {output_path}")
-          print(df.head())
+          df.to_excel("foodies_profiles.xlsx", index=False, engine="openpyxl")
+          print("Saved to foodies_profiles.xlsx")
+          if not df.empty:
+              print(df.head(10).to_string())
+          else:
+              print("Empty DataFrame – check URL or selectors.")
           PYEOF
 
       - name: Upload XLSX artifact
@@ -225,6 +262,7 @@ jobs:
           name: foodies-profiles
           path: foodies_profiles.xlsx
           retention-days: 30
+          if-no-files-found: warn
 
       - name: Summary
         run: |
@@ -234,4 +272,7 @@ jobs:
           echo "- **Start page**: ${{ github.event.inputs.start_page }}" >> $GITHUB_STEP_SUMMARY
           if [ -f foodies_profiles.xlsx ]; then
             echo "- **Artifact**: foodies_profiles.xlsx uploaded" >> $GITHUB_STEP_SUMMARY
+            python -c "import pandas as pd; df=pd.read_excel('foodies_profiles.xlsx'); print(f'- **Rows scraped**: {len(df)}')" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **No file produced**" >> $GITHUB_STEP_SUMMARY
           fi
