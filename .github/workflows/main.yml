@@ -1,7 +1,17 @@
-name: Scrape Foodies Profiles
+name: Scrape Foodies Profiles (Multi-IP Race)
 on:
   workflow_dispatch:
     inputs:
+      num_jobs:
+        description: 'How many parallel jobs to launch to find a runner IP that can reach the site (e.g. 5 or 7)'
+        required: true
+        default: '5'
+        type: choice
+        options:
+          - '3'
+          - '5'
+          - '7'
+          - '10'
       list_url:
         description: 'Main list URL (must be full URL, e.g. https://www.example.com/masterchef/)'
         required: true
@@ -18,7 +28,7 @@ on:
         default: '50'
         type: string
       concurrency:
-        description: 'How many profiles to scrape in parallel at once (Phase 2)'
+        description: 'How many profiles to scrape in parallel at once (Phase 2, within the winning job)'
         required: true
         default: '5'
         type: string
@@ -33,29 +43,53 @@ on:
         default: 'Profiles'
         type: string
       page_wait_ms:
-        description: 'Milliseconds to wait after a list page loads before scrolling/parsing (raise this ONLY if pages use lazy-load/JS rendering; lower = faster)'
+        description: 'Milliseconds to wait after a list page loads before scrolling/parsing'
         required: false
         default: '900'
         type: string
       profile_wait_ms:
-        description: 'Milliseconds to wait after a profile page loads before scraping it (raise this ONLY if image/about text loads late; lower = faster)'
+        description: 'Milliseconds to wait after a profile page loads before scraping it'
         required: false
         default: '600'
         type: string
+
 jobs:
+  # ------------------------------------------------------------------
+  # Build the matrix [1, 2, ... N] from the num_jobs input so you can
+  # pick 5 or 7 (or 3/10) at trigger time without editing the workflow.
+  # ------------------------------------------------------------------
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: |
+          N="${{ github.event.inputs.num_jobs }}"
+          MATRIX=$(python3 -c "import json; print(json.dumps(list(range(1, int('$N') + 1))))")
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Launching $N parallel instances: $MATRIX"
+
   scrape:
+    needs: setup
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        instance: ${{ fromJson(needs.setup.outputs.matrix) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install dependencies
         run: |
-          echo "=== Installing Python packages ==="
+          echo "=== [Instance ${{ matrix.instance }}] Installing Python packages ==="
           python -m pip install --upgrade pip
           pip install playwright pandas openpyxl beautifulsoup4 lxml
           echo "=== Installing Chromium for Playwright ==="
@@ -66,6 +100,7 @@ jobs:
           sudo cp rclone-*-linux-amd64/rclone /usr/local/bin/
           rclone version
           echo "=== Dependencies ready ==="
+
       - name: Configure rclone (Mega.nz) from single secret
         env:
           RCLONE_CONFIG_MEGA: ${{ secrets.RCLONE_CONFIG_MEGA }}
@@ -78,7 +113,138 @@ jobs:
           echo "$RCLONE_CONFIG_MEGA" > ~/.config/rclone/rclone.conf
           echo "rclone.conf written"
           rclone listremotes
+
+      # ------------------------------------------------------------------
+      # STEP 1: quick, cheap reachability probe from THIS runner's IP.
+      # No retries loop, no Phase 1/2 — just "can I even load the list page".
+      # ------------------------------------------------------------------
+      - name: Probe site accessibility
+        id: probe
+        env:
+          LIST_URL: ${{ github.event.inputs.list_url }}
+        run: |
+          python3 -u << 'PYEOF'
+          import os, sys, time
+          from urllib.parse import urlparse
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          LIST_URL = os.environ["LIST_URL"].strip()
+          accessible = False
+          reason = ""
+
+          BROWSER_ARGS = [
+              "--disable-blink-features=AutomationControlled",
+              "--no-sandbox",
+              "--disable-dev-shm-usage",
+              "--disable-http2",
+              "--ignore-certificate-errors",
+              "--disable-web-security",
+          ]
+          USER_AGENT = (
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+          )
+          EXTRA_HEADERS = {
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.9",
+          }
+          STEALTH_SCRIPT = """
+              Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+              Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+              Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+              window.chrome = { runtime: {} };
+          """
+
+          try:
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
+                  context = browser.new_context(
+                      user_agent=USER_AGENT,
+                      viewport={"width": 1280, "height": 900},
+                      locale="en-US",
+                      extra_http_headers=EXTRA_HEADERS,
+                  )
+                  context.add_init_script(STEALTH_SCRIPT)
+                  page = context.new_page()
+                  resp = page.goto(LIST_URL, wait_until="domcontentloaded", timeout=25000)
+                  status = resp.status if resp else None
+                  html = page.content()
+                  browser.close()
+
+              lower = html.lower()
+              blocked_kw = ["cloudflare", "attention required", "just a moment", "access denied", "captcha"]
+              if status and status >= 400:
+                  reason = f"HTTP {status}"
+              elif any(k in lower for k in blocked_kw):
+                  reason = "bot-protection / block page detected"
+              elif len(html) < 500:
+                  reason = f"suspiciously short response ({len(html)} bytes)"
+              else:
+                  accessible = True
+                  reason = f"OK (HTTP {status}, {len(html)} bytes)"
+          except PWTimeout:
+              reason = "timeout"
+          except Exception as e:
+              reason = f"{type(e).__name__}: {e}"
+
+          print(f"[Instance ${{ matrix.instance }}] Probe result: accessible={accessible} ({reason})")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"accessible={'true' if accessible else 'false'}\n")
+              f.write(f"reason={reason}\n")
+          PYEOF
+
+      # ------------------------------------------------------------------
+      # STEP 2: only instances that CAN reach the site race for a lock
+      # stored on Mega.nz. First one to write it wins and does the scrape;
+      # everyone else backs off immediately. A stale lock (>25 min old,
+      # e.g. left behind by a crashed run) is treated as free.
+      # ------------------------------------------------------------------
+      - name: Attempt to claim scrape lock (first accessible instance wins)
+        id: lock
+        if: steps.probe.outputs.accessible == 'true'
+        run: |
+          mkdir -p lock
+          LOCK_ID="run${{ github.run_id }}-inst${{ matrix.instance }}-$(date +%s)"
+          echo "$LOCK_ID" > lock/mine.txt
+
+          rclone cat mega:foodies-scrape/.run-lock.txt > lock/current.txt 2>/dev/null || echo "" > lock/current.txt
+          CURRENT=$(cat lock/current.txt)
+          NOW=$(date +%s)
+          STALE=false
+
+          if [ -n "$CURRENT" ]; then
+            LOCK_TS=$(echo "$CURRENT" | grep -oE '[0-9]+$' || echo 0)
+            AGE=$((NOW - LOCK_TS))
+            echo "Existing lock: $CURRENT (age ${AGE}s)"
+            if [ "$AGE" -gt 1500 ]; then
+              echo "Lock is stale (>25min) — treating as free"
+              STALE=true
+            fi
+          else
+            echo "No existing lock — free"
+            STALE=true
+          fi
+
+          if [ -z "$CURRENT" ] || [ "$STALE" == "true" ]; then
+            rclone copyto lock/mine.txt mega:foodies-scrape/.run-lock.txt
+            sleep 3
+            rclone cat mega:foodies-scrape/.run-lock.txt > lock/verify.txt
+            WINNER=$(cat lock/verify.txt)
+            if [ "$WINNER" == "$LOCK_ID" ]; then
+              echo "✅ Instance ${{ matrix.instance }}: lock acquired ($LOCK_ID) — this instance will scrape"
+              echo "acquired=true" >> "$GITHUB_OUTPUT"
+              echo "$LOCK_ID" > lock/my_lock_id.txt
+            else
+              echo "❌ Instance ${{ matrix.instance }}: lost the race — lock held by $WINNER"
+              echo "acquired=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "❌ Instance ${{ matrix.instance }}: lock already held by $CURRENT — backing off"
+            echo "acquired=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download previous state from Mega.nz
+        if: steps.lock.outputs.acquired == 'true'
         run: |
           mkdir -p data
           rclone copy mega:foodies-scrape/image_urls.txt data/ --ignore-errors || true
@@ -95,7 +261,9 @@ jobs:
           else
             echo "No previous xlsx – will create new"
           fi
+
       - name: Scrape profiles (parallel) and generate / append XLSX
+        if: steps.lock.outputs.acquired == 'true'
         env:
           LIST_URL: ${{ github.event.inputs.list_url }}
           SCRAPE_ALL_PER_PAGE: ${{ github.event.inputs.scrape_all_per_page }}
@@ -149,7 +317,7 @@ jobs:
           DEBUG_HTML_FILE = DATA_DIR / "debug_first_profile.html"
           MAX_EMPTY_STREAK = 3
           MAX_RETRIES_PER_PAGE = 3
-          CHECKPOINT_EVERY = 25  # save to disk every N newly-scraped profiles (kept in memory between writes — see save_checkpoint)
+          CHECKPOINT_EVERY = 25
 
           BROWSER_ARGS = [
               "--disable-blink-features=AutomationControlled",
@@ -183,7 +351,6 @@ jobs:
           """
 
           def new_stealth_page(p):
-              """Launch a fresh browser/context/page with the same stealth config used everywhere."""
               browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
               context = browser.new_context(
                   user_agent=USER_AGENT,
@@ -223,7 +390,6 @@ jobs:
           log(f" start_page = {START_PAGE}")
           log(f" sheet_name = {SHEET_NAME}")
           log(f" page_wait_ms = {PAGE_WAIT_MS} | profile_wait_ms = {PROFILE_WAIT_MS}")
-          # DNS check
           host = parsed.netloc.split(":")[0]
           try:
               ips = socket.getaddrinfo(host, None)
@@ -231,10 +397,7 @@ jobs:
               log(f" DNS OK → {host} resolves to: {', '.join(unique_ips)}")
           except socket.gaierror as e:
               log(f" DNS FAILED for host '{host}': {e}")
-              log(" → Site domain does not exist or DNS is blocked from this runner")
-              log(" → Fix the URL or check if the domain is correct")
               raise SystemExit(1)
-          # Quick TCP connectivity check (port 443 / 80)
           port = 443 if parsed.scheme == "https" else 80
           try:
               sock = socket.create_connection((host, port), timeout=10)
@@ -242,7 +405,6 @@ jobs:
               log(f" TCP connect to {host}:{port} → OK")
           except Exception as e:
               log(f" TCP connect to {host}:{port} FAILED: {type(e).__name__}: {e}")
-              log(" → Possible causes: site down, firewall, GitHub runner IP blocked, or geo-restriction")
 
           def build_page_url(base: str, page_num: int) -> str:
               p = urlparse(base)
@@ -254,9 +416,6 @@ jobs:
               new_query = urlencode(qs, doseq=True)
               return urlunparse((p.scheme, p.netloc, p.path or "/", p.params, new_query, p.fragment))
 
-          # ------------------------------------------------------------------
-          # Load already-known image URLs
-          # ------------------------------------------------------------------
           known_image_urls = set()
           if IMAGE_URLS_FILE.exists():
               with open(IMAGE_URLS_FILE, "r", encoding="utf-8") as f:
@@ -267,16 +426,8 @@ jobs:
           log(f" Loaded {len(known_image_urls)} known image URLs (will skip matches)")
           known_urls_lock = threading.Lock()
 
-          # ------------------------------------------------------------------
-          # Checkpoint / save helpers — called incrementally, not just at the
-          # very end, so a crash / timeout mid-run never loses everything.
-          # ------------------------------------------------------------------
           save_lock = threading.Lock()
 
-          # Load the existing sheet into memory ONCE. Every checkpoint after this
-          # appends to this in-memory frame and writes it out — it never re-reads
-          # the xlsx from disk again, which is what made checkpointing slow before
-          # (that re-read got more expensive every single time as the sheet grew).
           if XLSX_FILE.exists():
               try:
                   book = load_workbook(XLSX_FILE, read_only=True)
@@ -290,17 +441,14 @@ jobs:
                   existing_df = pd.DataFrame(columns=["image_url", "full_name", "about", "profile_url"])
           else:
               existing_df = pd.DataFrame(columns=["image_url", "full_name", "about", "profile_url"])
-          accumulated_new = []  # all new rows collected across the whole run, in memory
+          accumulated_new = []
 
           def save_checkpoint(results_batch, reason=""):
-              """Append results_batch to the in-memory frame and flush everything to disk."""
               with save_lock:
                   DATA_DIR.mkdir(parents=True, exist_ok=True)
-                  # --- image_urls.txt (cheap — always safe to do every checkpoint) ---
                   with open(IMAGE_URLS_FILE, "w", encoding="utf-8") as f:
                       for u in sorted(known_image_urls):
                           f.write(u + "\n")
-                  # --- xlsx: combine in-memory only, no disk re-read ---
                   accumulated_new.extend(results_batch)
                   new_df = pd.DataFrame(accumulated_new, columns=["image_url", "full_name", "about", "profile_url"])
                   combined = pd.concat([existing_df, new_df], ignore_index=True)
@@ -333,7 +481,6 @@ jobs:
               page_obj.on("requestfailed", lambda req: log(
                   f" [req failed] {req.url[:100]} → {req.failure}"
               ))
-              # ========== PHASE 1 ==========
               while not cap_reached():
                   url = build_page_url(LIST_URL, page)
                   log("-" * 50)
@@ -358,7 +505,6 @@ jobs:
                                   time.sleep(3 * attempt)
                                   continue
                               break
-                          # single scroll-to-bottom + one configurable wait so lazy-loaded cards/images render
                           page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                           page_obj.wait_for_timeout(PAGE_WAIT_MS)
                           html = page_obj.content()
@@ -371,19 +517,6 @@ jobs:
                       except Exception as e:
                           last_error = f"{type(e).__name__}: {e}"
                           log(f" ✗ attempt {attempt} failed: {last_error}")
-                          err_str = str(e).lower()
-                          if "err_http2_protocol_error" in err_str or "http2" in err_str:
-                              log(" → HTTP/2 protocol error (common with bot protection or bad CDN)")
-                          elif "err_connection_refused" in err_str:
-                              log(" → Connection refused – site may be down or blocking this IP")
-                          elif "err_name_not_resolved" in err_str or "dns" in err_str:
-                              log(" → DNS failure – domain does not resolve")
-                          elif "err_connection_timed_out" in err_str or "timeout" in err_str:
-                              log(" → Connection timeout – network issue or site very slow / blocked")
-                          elif "err_ssl" in err_str or "certificate" in err_str:
-                              log(" → SSL/TLS problem")
-                          elif "net::err_" in err_str:
-                              log(f" → Chromium network error: {e}")
                       if attempt < MAX_RETRIES_PER_PAGE:
                           wait = 2 * attempt
                           log(f" waiting {wait}s before retry ...")
@@ -394,15 +527,9 @@ jobs:
                       empty_pages_streak += 1
                       if empty_pages_streak >= MAX_EMPTY_STREAK:
                           log(f" {MAX_EMPTY_STREAK} consecutive failures → stop Phase 1")
-                          log(" Possible reasons:")
-                          log(" • Site is blocking GitHub Actions IPs")
-                          log(" • Domain is wrong / site is down")
-                          log(" • Strong bot protection (Cloudflare, etc.)")
-                          log(" • Network / HTTP2 issues from the runner")
                           break
                       page += 1
                       continue
-                  # ----- parse links -----
                   soup = BeautifulSoup(html, "lxml")
                   title = (soup.title.string or "(no title)").strip() if soup.title else "(no title)"
                   log(f" Page title: {title}")
@@ -418,19 +545,6 @@ jobs:
                       links = soup.select("a[href*='profile']")
                       log(f" fallback 'a[href*=\"profile\"]' → {len(links)}")
                   if not links:
-                      body_preview = (soup.body.get_text(" ", strip=True)[:300] if soup.body else "")
-                      log(f" Body text preview: {body_preview!r}")
-                      sample = soup.select("div[class]")[:12]
-                      log(" Sample div classes:")
-                      for d in sample:
-                          log(f" class=\"{' '.join(d.get('class', []))}\"")
-                      paginator = soup.select_one("div.paginator")
-                      log(f" paginator present: {bool(paginator)}")
-                      lower_body = body_preview.lower()
-                      if any(x in lower_body for x in ["cloudflare", "attention required", "just a moment", "access denied", "blocked"]):
-                          log(" !!! Looks like a Cloudflare / bot-protection / access-denied page")
-                      if "captcha" in lower_body:
-                          log(" !!! CAPTCHA detected")
                       empty_pages_streak += 1
                       if empty_pages_streak >= MAX_EMPTY_STREAK:
                           log(f" No usable links for {MAX_EMPTY_STREAK} pages → stop Phase 1")
@@ -456,24 +570,17 @@ jobs:
                       new += 1
                       if new <= 5 or new % 10 == 0:
                           log(f" + profile URL [{len(profile_urls)}]: {full}")
-                  if hit_cap_mid_page:
-                      log(f" Added {new} new URLs this page (stopped partway — max_profiles cap of {MAX_PROFILES} reached) → total unique: {len(profile_urls)}")
-                  else:
-                      log(f" Added {new} new URLs this page (all links on page) → total unique: {len(profile_urls)}")
+                  log(f" Added {new} new URLs this page → total unique: {len(profile_urls)}")
                   if new == 0:
                       empty_pages_streak += 1
-                      log(f" No new profile URLs this page (streak={empty_pages_streak})")
                       if empty_pages_streak >= MAX_EMPTY_STREAK:
-                          log(f" {MAX_EMPTY_STREAK} consecutive pages with no new data → stop Phase 1")
                           break
                   else:
                       empty_pages_streak = 0
-                  # next page detection
                   next_link = soup.select_one(
                       "div.paginator a.next, a.next.pill, a[aria-label='Next page'], a[title='Next page']"
                   )
                   has_next = bool(next_link and next_link.get("href"))
-                  log(f" next_link present: {has_next}")
                   if not has_next:
                       page_links = soup.select("div.paginator a[href*='page='], a.pill[href*='page=']")
                       if page_links:
@@ -483,7 +590,6 @@ jobs:
                                   for a in page_links if re.search(r"page=(\d+)", a.get("href", ""))
                               ]
                               max_p = max(nums) if nums else page
-                              log(f" highest page num found: {max_p}")
                               if page < max_p:
                                   has_next = True
                           except Exception as e:
@@ -496,22 +602,13 @@ jobs:
               log("=" * 60)
               log(f"PHASE 1 DONE → {len(profile_urls)} profile URLs collected")
               log("=" * 60)
-              log("Closing Phase 1 browser ...")
               browser.close()
-              log("Phase 1 browser closed")
 
-          # ------------------------------------------------------------------
-          # PHASE 2: Parallel profile scraping
-          # Each worker owns its own Playwright/browser instance (sync API is
-          # not thread-safe, so browsers are never shared across threads) and
-          # works through its own slice of profile_urls sequentially.
-          # ------------------------------------------------------------------
           extraction_stats = {"name": 0, "about": 0, "image": 0, "total": 0}
           stats_lock = threading.Lock()
           debug_html_saved = threading.Event()
 
           def extract_profile(soup, purl, html):
-              # --- image_url + full_name: <div class="card-image"><img src=... alt="Chef Sultan">...
               image_url = ""
               full_name = ""
               img_el = soup.select_one("div.card-image img")
@@ -522,23 +619,17 @@ jobs:
                   alt = (img_el.get("alt") or "").strip()
                   if alt:
                       full_name = alt
-              # fallback: the visible name is injected via CSS `.card-title::before { content: "..." }`
-              # in an inline <style> block — not real element text, so pull it out with regex instead.
               if not full_name:
                   m = re.search(r"\.card-title::before\s*\{[^}]*content:\s*[\"']([^\"']+)[\"']", html)
                   if m:
                       full_name = m.group(1).strip()
-              # last-resort fallback: page <title>
               if not full_name and soup.title:
                   full_name = (soup.title.string or "").split("|")[0].split("-")[0].strip()
-
-              # --- about: <div class="desc"><div class="subtitle">About:</div><p>...</p></div>
               about = ""
               desc_el = soup.select_one("div.desc p") or soup.select_one("div.desc")
               if desc_el:
                   about = desc_el.get_text(" ", strip=True)
                   about = re.sub(r"^About:\s*", "", about, flags=re.I).strip()
-
               return full_name, about, image_url
 
           def worker_scrape(chunk, worker_id):
@@ -562,21 +653,15 @@ jobs:
                       except Exception as e:
                           log(f"[W{worker_id}]  ✗ ERROR loading profile: {type(e).__name__}: {e}")
                           local_results.append({
-                              "image_url": "",
-                              "full_name": "",
-                              "about": f"ERROR: {e}",
-                              "profile_url": purl,
+                              "image_url": "", "full_name": "", "about": f"ERROR: {e}", "profile_url": purl,
                           })
                           continue
-                      # Save one raw HTML sample so selectors can be checked/fixed against
-                      # the real page structure (only ever the first profile, across all workers).
                       if not debug_html_saved.is_set():
                           try:
                               DATA_DIR.mkdir(parents=True, exist_ok=True)
                               with open(DEBUG_HTML_FILE, "w", encoding="utf-8") as f:
                                   f.write(html)
                               debug_html_saved.set()
-                              log(f"[W{worker_id}]  📝 saved raw HTML sample → {DEBUG_HTML_FILE} (use this to fix selectors if fields keep coming back empty)")
                           except Exception:
                               pass
                       soup = BeautifulSoup(html, "lxml")
@@ -592,20 +677,14 @@ jobs:
                       if image_url:
                           with known_urls_lock:
                               if image_url in known_image_urls:
-                                  log(f"[W{worker_id}]  ⏭ SKIP duplicate image_url: {image_url[:80]}...")
                                   local_dups += 1
                                   continue
                               known_image_urls.add(image_url)
                       local_results.append({
-                          "image_url": image_url,
-                          "full_name": full_name,
-                          "about": about,
-                          "profile_url": purl,
+                          "image_url": image_url, "full_name": full_name, "about": about, "profile_url": purl,
                       })
                       since_last_checkpoint += 1
                       log(f"[W{worker_id}]  ✓ saved: name={full_name[:40]!r} | img={bool(image_url)} | about_len={len(about)}")
-                      # Incremental checkpoint: don't wait for every worker to finish before
-                      # writing to disk — a timeout or crash mid-run should not lose everything.
                       if since_last_checkpoint >= CHECKPOINT_EVERY:
                           save_checkpoint(local_results[-since_last_checkpoint:], reason=f"W{worker_id} +{since_last_checkpoint}")
                           since_last_checkpoint = 0
@@ -642,22 +721,12 @@ jobs:
                           total_dups += chunk_dups
               except Exception as e:
                   log(f" ✗ Phase 2 crashed: {type(e).__name__}: {e}")
-                  log(" → Whatever was scraped before the crash was already checkpointed to disk.")
               log(f"PHASE 2 DONE → {len(results)} new profiles, {total_dups} duplicates skipped")
               if extraction_stats["total"]:
                   log(f" Extraction hit-rate → name: {extraction_stats['name']}/{extraction_stats['total']}, "
                       f"about: {extraction_stats['about']}/{extraction_stats['total']}, "
                       f"image: {extraction_stats['image']}/{extraction_stats['total']}")
-                  if extraction_stats["image"] == 0 or extraction_stats["name"] == 0:
-                      log(" ⚠️  A field extracted 0 times across every profile — the CSS selectors in")
-                      log("    extract_profile() almost certainly don't match this site's real markup.")
-                      log(f"    Check {DEBUG_HTML_FILE} (uploaded as a workflow artifact) and update the")
-                      log("    selectors to match the actual name / bio / image elements on the page.")
 
-          # ------------------------------------------------------------------
-          # Final persist (covers any results not yet checkpointed, e.g. if a
-          # worker's chunk was smaller than CHECKPOINT_EVERY)
-          # ------------------------------------------------------------------
           DATA_DIR.mkdir(parents=True, exist_ok=True)
           with open(IMAGE_URLS_FILE, "w", encoding="utf-8") as f:
               for u in sorted(known_image_urls):
@@ -679,36 +748,51 @@ jobs:
           log(f"SCRAPE FINISHED → {len(results)} new profiles")
           log("=" * 60)
           PYEOF
+
       - name: Upload results to Mega.nz (single final upload)
+        if: steps.lock.outputs.acquired == 'true'
         run: |
-          echo "=== Uploading to mega:foodies-scrape/ (once, after scraping is fully complete) ==="
+          echo "=== Uploading to mega:foodies-scrape/ ==="
           rclone mkdir mega:foodies-scrape || true
           rclone copy data/image_urls.txt mega:foodies-scrape/ --progress
           rclone copy data/foodies_profiles.xlsx mega:foodies-scrape/ --progress
           echo "=== Upload done ==="
           rclone ls mega:foodies-scrape/
+
       - name: Upload XLSX artifact (GitHub)
+        if: steps.lock.outputs.acquired == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: foodies-profiles
+          name: foodies-profiles-instance-${{ matrix.instance }}
           path: |
             foodies_profiles.xlsx
             data/image_urls.txt
             data/debug_first_profile.html
           retention-days: 30
           if-no-files-found: warn
-      - name: Summary
+
+      # Always release the lock if we're the one holding it, so a future
+      # run isn't blocked by this instance's claim.
+      - name: Release lock
+        if: always() && steps.lock.outputs.acquired == 'true'
         run: |
-          echo "### Scrape complete" >> $GITHUB_STEP_SUMMARY
-          echo "- **URL**: ${{ github.event.inputs.list_url }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Scrape all per page**: ${{ github.event.inputs.scrape_all_per_page }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Max new profiles (if not scrape-all)**: ${{ github.event.inputs.max_profiles }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Concurrency**: ${{ github.event.inputs.concurrency }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Start page**: ${{ github.event.inputs.start_page }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Sheet / tab name**: ${{ github.event.inputs.sheet_name }}" >> $GITHUB_STEP_SUMMARY
-          if [ -f foodies_profiles.xlsx ]; then
-            echo "- **Artifact**: foodies_profiles.xlsx + image_urls.txt uploaded" >> $GITHUB_STEP_SUMMARY
-            python -c "
+          CURRENT=$(rclone cat mega:foodies-scrape/.run-lock.txt 2>/dev/null || echo "")
+          MY_ID=$(cat lock/my_lock_id.txt 2>/dev/null || echo "")
+          if [ -n "$MY_ID" ] && [ "$CURRENT" == "$MY_ID" ]; then
+            rclone deletefile mega:foodies-scrape/.run-lock.txt
+            echo "Lock released"
+          else
+            echo "Lock not owned by this instance anymore — leaving as is"
+          fi
+
+      - name: Instance summary
+        if: always()
+        run: |
+          echo "### Instance ${{ matrix.instance }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.lock.outputs.acquired }}" == "true" ]; then
+            echo "- ✅ Reachable + won the lock → this instance ran the scrape" >> $GITHUB_STEP_SUMMARY
+            if [ -f foodies_profiles.xlsx ]; then
+              python -c "
           import pandas as pd
           from openpyxl import load_workbook
           wb = load_workbook('foodies_profiles.xlsx')
@@ -718,7 +802,9 @@ jobs:
               df = pd.read_excel('foodies_profiles.xlsx', sheet_name=sheet)
               print(f'- **Rows in sheet \"{sheet}\":** {len(df)}')
           " >> $GITHUB_STEP_SUMMARY
+            fi
+          elif [ "${{ steps.probe.outputs.accessible }}" == "true" ]; then
+            echo "- 🌐 Reachable, but lost the race to another instance → skipped" >> $GITHUB_STEP_SUMMARY
           else
-            echo "- **No xlsx produced**" >> $GITHUB_STEP_SUMMARY
+            echo "- 🚫 Site NOT reachable from this runner's IP (${{ steps.probe.outputs.reason }}) → skipped" >> $GITHUB_STEP_SUMMARY
           fi
-          echo "- **Mega.nz**: uploaded once to mega:foodies-scrape/ at the end" >> $GITHUB_STEP_SUMMARY
