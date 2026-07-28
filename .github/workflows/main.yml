@@ -608,9 +608,18 @@ jobs:
           stats_lock = threading.Lock()
           debug_html_saved = threading.Event()
 
+          # Generic boilerplate titles that show up on every profile when the
+          # page hasn't actually rendered per-profile content yet (SPA shell /
+          # default meta title) — never accept these as a real full_name.
+          GENERIC_TITLES = {
+              "enjoy your favorite chef profile",
+          }
+
           def extract_profile(soup, purl, html):
               image_url = ""
               full_name = ""
+
+              # --- image + name from <div class="card-image"><img src=... alt="Chef Sultan"> ---
               img_el = soup.select_one("div.card-image img")
               if img_el:
                   src = img_el.get("src") or img_el.get("data-src") or img_el.get("data-lazy-src") or ""
@@ -619,17 +628,46 @@ jobs:
                   alt = (img_el.get("alt") or "").strip()
                   if alt:
                       full_name = alt
+
+              # --- fallback name: injected via CSS `#Chef-card .card-title::before { content: "..." }` ---
+              # Minifiers often drop the space / use a single colon (":before" not "::before"),
+              # so the regex must tolerate both, plus no-space variants.
               if not full_name:
-                  m = re.search(r"\.card-title::before\s*\{[^}]*content:\s*[\"']([^\"']+)[\"']", html)
+                  m = re.search(
+                      r"\.card-title\s*:{1,2}\s*before\s*\{[^}]*content\s*:\s*[\"']([^\"']+)[\"']",
+                      html, re.I,
+                  )
                   if m:
-                      full_name = m.group(1).strip()
+                      raw = m.group(1).strip()
+                      # Typical content string looks like "Ashley's as chef Profile" —
+                      # pull just the name portion before the possessive "'s".
+                      name_m = re.match(r"^(.+?)'s\b", raw)
+                      full_name = name_m.group(1).strip() if name_m else raw
+
+              # --- last-resort: <title>, but reject generic/boilerplate titles ---
               if not full_name and soup.title:
-                  full_name = (soup.title.string or "").split("|")[0].split("-")[0].strip()
+                  t = (soup.title.string or "").strip()
+                  if t and t.lower() not in GENERIC_TITLES:
+                      full_name = t.split("|")[0].split("-")[0].strip()
+
+              # --- about from <div class="desc"><div class="subtitle">About:</div><p>...</p></div> ---
               about = ""
-              desc_el = soup.select_one("div.desc p") or soup.select_one("div.desc")
-              if desc_el:
-                  about = desc_el.get_text(" ", strip=True)
-                  about = re.sub(r"^About:\s*", "", about, flags=re.I).strip()
+              desc_p = soup.select_one("div.desc p")
+              if desc_p:
+                  about = desc_p.get_text(" ", strip=True)
+              else:
+                  desc_container = soup.select_one("div.desc")
+                  if desc_container:
+                      about = desc_container.get_text(" ", strip=True)
+              about = re.sub(r"^About:\s*", "", about, flags=re.I).strip()
+
+              # last-resort: hunt for "About: ..." anywhere in the rendered text
+              if not about:
+                  text = soup.get_text(" ", strip=True)
+                  m2 = re.search(r"About:\s*(.+?)(?:$)", text)
+                  if m2:
+                      about = m2.group(1).strip()[:800]
+
               return full_name, about, image_url
 
           def worker_scrape(chunk, worker_id):
@@ -643,17 +681,46 @@ jobs:
                   since_last_checkpoint = 0
                   for i, purl in enumerate(chunk, 1):
                       log(f"[W{worker_id}] {i}/{len(chunk)} → {purl}")
-                      try:
-                          t0 = time.time()
-                          resp = page_obj.goto(purl, wait_until="domcontentloaded", timeout=45000)
-                          log(f"[W{worker_id}]  goto done in {time.time()-t0:.1f}s | status={resp.status if resp else 'N/A'}")
-                          page_obj.evaluate("window.scrollTo(0, 400)")
-                          page_obj.wait_for_timeout(PROFILE_WAIT_MS)
-                          html = page_obj.content()
-                      except Exception as e:
-                          log(f"[W{worker_id}]  ✗ ERROR loading profile: {type(e).__name__}: {e}")
+                      html = ""
+                      load_error = None
+                      # Up to 2 tries: the site is client-rendered, so a bare
+                      # domcontentloaded snapshot can catch an empty shell.
+                      # Wait for one of the real content elements to actually
+                      # appear before reading page.content(); reload once and
+                      # retry if it never shows up.
+                      for load_attempt in range(1, 3):
+                          try:
+                              t0 = time.time()
+                              resp = page_obj.goto(purl, wait_until="domcontentloaded", timeout=45000)
+                              log(f"[W{worker_id}]  goto attempt {load_attempt} done in {time.time()-t0:.1f}s | status={resp.status if resp else 'N/A'}")
+                              try:
+                                  page_obj.wait_for_load_state("networkidle", timeout=12000)
+                              except PlaywrightTimeout:
+                                  log(f"[W{worker_id}]  (networkidle wait timed out, continuing anyway)")
+                              page_obj.evaluate("window.scrollTo(0, 400)")
+                              try:
+                                  page_obj.wait_for_selector(
+                                      "div.card-image, div.desc, #Chef-card",
+                                      timeout=15000,
+                                  )
+                              except PlaywrightTimeout:
+                                  log(f"[W{worker_id}]  ⚠ content selectors not found within 15s (attempt {load_attempt})")
+                                  if load_attempt == 1:
+                                      log(f"[W{worker_id}]  reloading and retrying once ...")
+                                      continue
+                              page_obj.wait_for_timeout(PROFILE_WAIT_MS)
+                              html = page_obj.content()
+                              load_error = None
+                              break
+                          except Exception as e:
+                              load_error = e
+                              log(f"[W{worker_id}]  ✗ load attempt {load_attempt} failed: {type(e).__name__}: {e}")
+                              if load_attempt < 2:
+                                  time.sleep(2)
+                      if load_error is not None or not html:
+                          log(f"[W{worker_id}]  ✗ ERROR loading profile after retries: {load_error}")
                           local_results.append({
-                              "image_url": "", "full_name": "", "about": f"ERROR: {e}", "profile_url": purl,
+                              "image_url": "", "full_name": "", "about": f"ERROR: {load_error}", "profile_url": purl,
                           })
                           continue
                       if not debug_html_saved.is_set():
