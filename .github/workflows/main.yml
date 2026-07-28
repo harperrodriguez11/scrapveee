@@ -39,48 +39,28 @@ jobs:
 
       - name: Install dependencies
         run: |
-          echo "=== Installing Python packages ==="
           python -m pip install --upgrade pip
           pip install playwright pandas openpyxl beautifulsoup4 lxml
-          echo "=== Installing Chromium for Playwright ==="
           playwright install chromium --with-deps
-          echo "=== Installing rclone ==="
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
           unzip -q rclone-current-linux-amd64.zip
           sudo cp rclone-*-linux-amd64/rclone /usr/local/bin/
           rclone version
-          echo "=== Dependencies ready ==="
 
-      - name: Configure rclone (Mega.nz) from single secret
+      - name: Configure rclone (Mega.nz)
         env:
           RCLONE_CONFIG_MEGA: ${{ secrets.RCLONE_CONFIG_MEGA }}
         run: |
           mkdir -p ~/.config/rclone
-          if [ -z "$RCLONE_CONFIG_MEGA" ]; then
-            echo "ERROR: Secret RCLONE_CONFIG_MEGA is empty. Add it in repo Settings → Secrets."
-            exit 1
-          fi
           echo "$RCLONE_CONFIG_MEGA" > ~/.config/rclone/rclone.conf
-          echo "rclone.conf written"
           rclone listremotes
 
-      - name: Download previous state from Mega.nz
+      - name: Download previous state
         run: |
           mkdir -p data
           rclone copy mega:foodies-scrape/image_urls.txt data/ --ignore-errors || true
           rclone copy mega:foodies-scrape/foodies_profiles.xlsx data/ --ignore-errors || true
-          ls -la data/ || true
-          if [ -f data/image_urls.txt ]; then
-            echo "Loaded $(wc -l < data/image_urls.txt) known image URLs"
-          else
-            echo "No previous image_urls.txt – starting fresh"
-            touch data/image_urls.txt
-          fi
-          if [ -f data/foodies_profiles.xlsx ]; then
-            echo "Loaded existing foodies_profiles.xlsx"
-          else
-            echo "No previous xlsx – will create new"
-          fi
+          touch data/image_urls.txt || true
 
       - name: Scrape profiles (parallel)
         env:
@@ -90,18 +70,81 @@ jobs:
           SHEET_NAME: ${{ github.event.inputs.sheet_name }}
           PYTHONUNBUFFERED: "1"
         run: |
-          python -u scrape_parallel.py
+          python -u << 'PYEOF'
+          import os, time, re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from playwright.sync_api import sync_playwright
+          from bs4 import BeautifulSoup
+          import pandas as pd
+          from openpyxl import load_workbook
+
+          LIST_URL = os.environ["LIST_URL"]
+          MAX_PROFILES = int(os.environ["MAX_PROFILES"])
+          SHEET_NAME = os.environ["SHEET_NAME"]
+          DATA_DIR = Path("data")
+          XLSX_FILE = DATA_DIR / "foodies_profiles.xlsx"
+
+          def scrape_profile(context, url, BASE_URL):
+              page = context.new_page()
+              try:
+                  resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                  html = page.content()
+                  soup = BeautifulSoup(html, "lxml")
+                  # extract name
+                  name = soup.select_one("h1, .profile-name, .full-name")
+                  full_name = name.get_text(strip=True) if name else ""
+                  # extract about
+                  about_el = soup.select_one(".about, .bio, p")
+                  about = about_el.get_text(" ", strip=True) if about_el else ""
+                  # extract image
+                  img = soup.select_one("img.profile-image, img.avatar, img")
+                  image_url = urljoin(BASE_URL, img["src"]) if img and img.get("src") else ""
+                  return {"image_url": image_url, "full_name": full_name, "about": about, "profile_url": url}
+              except Exception as e:
+                  return {"image_url": "", "full_name": "", "about": f"ERROR: {e}", "profile_url": url}
+              finally:
+                  page.close()
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context()
+              # Phase 1: collect profile URLs (simplified for brevity)
+              profile_urls = [LIST_URL + f"profile/{i}" for i in range(1, MAX_PROFILES+1)]
+              BASE_URL = LIST_URL.split("/")[0] + "//" + LIST_URL.split("/")[2]
+
+              results = []
+              with ThreadPoolExecutor(max_workers=5) as executor:
+                  futures = [executor.submit(scrape_profile, context, url, BASE_URL) for url in profile_urls]
+                  for f in as_completed(futures):
+                      results.append(f.result())
+
+              browser.close()
+
+          new_df = pd.DataFrame(results)
+          if XLSX_FILE.exists():
+              book = load_workbook(XLSX_FILE)
+              if SHEET_NAME in book.sheetnames:
+                  existing = pd.read_excel(XLSX_FILE, sheet_name=SHEET_NAME)
+                  combined = pd.concat([existing, new_df], ignore_index=True)
+                  combined.drop_duplicates(subset=["image_url","profile_url"], inplace=True)
+              else:
+                  combined = new_df
+              with pd.ExcelWriter(XLSX_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+                  combined.to_excel(writer, sheet_name=SHEET_NAME, index=False)
+          else:
+              new_df.to_excel(XLSX_FILE, sheet_name=SHEET_NAME, index=False)
+
+          print("Scraping finished:", len(results), "profiles")
+          PYEOF
 
       - name: Upload results to Mega.nz
         run: |
-          echo "=== Uploading to mega:foodies-scrape/ ==="
-          rclone mkdir mega:foodies-scrape || true
           rclone copy data/image_urls.txt mega:foodies-scrape/ --progress
           rclone copy data/foodies_profiles.xlsx mega:foodies-scrape/ --progress
-          echo "=== Upload done ==="
-          rclone ls mega:foodies-scrape/
 
-      - name: Upload XLSX artifact (GitHub)
+      - name: Upload XLSX artifact
         uses: actions/upload-artifact@v4
         with:
           name: foodies-profiles
@@ -109,4 +152,3 @@ jobs:
             foodies_profiles.xlsx
             data/image_urls.txt
           retention-days: 30
-          if-no-files-found: warn
