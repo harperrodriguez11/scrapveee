@@ -1,4 +1,5 @@
 name: Scrape Foodies Profiles
+
 on:
   workflow_dispatch:
     inputs:
@@ -7,20 +8,10 @@ on:
         required: true
         default: 'https://foodies.com/food/'
         type: string
-      scrape_all_per_page:
-        description: 'Scrape ALL profiles found on each page (ignores max_profiles cap)'
-        required: true
-        default: false
-        type: boolean
       max_profiles:
-        description: 'Maximum number of NEW profiles to scrape this run (ignored if scrape_all_per_page = true)'
+        description: 'Maximum number of NEW profiles to scrape this run'
         required: true
         default: '50'
-        type: string
-      concurrency:
-        description: 'How many profiles to scrape in parallel at once (Phase 2)'
-        required: true
-        default: '5'
         type: string
       start_page:
         description: 'Starting page number'
@@ -32,6 +23,7 @@ on:
         required: true
         default: 'Profiles'
         type: string
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -39,10 +31,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install dependencies
         run: |
           echo "=== Installing Python packages ==="
@@ -56,6 +50,7 @@ jobs:
           sudo cp rclone-*-linux-amd64/rclone /usr/local/bin/
           rclone version
           echo "=== Dependencies ready ==="
+
       - name: Configure rclone (Mega.nz) from single secret
         env:
           RCLONE_CONFIG_MEGA: ${{ secrets.RCLONE_CONFIG_MEGA }}
@@ -68,6 +63,7 @@ jobs:
           echo "$RCLONE_CONFIG_MEGA" > ~/.config/rclone/rclone.conf
           echo "rclone.conf written"
           rclone listremotes
+
       - name: Download previous state from Mega.nz
         run: |
           mkdir -p data
@@ -85,552 +81,26 @@ jobs:
           else
             echo "No previous xlsx – will create new"
           fi
-      - name: Scrape profiles (parallel) and generate / append XLSX
+
+      - name: Scrape profiles (parallel)
         env:
           LIST_URL: ${{ github.event.inputs.list_url }}
-          SCRAPE_ALL_PER_PAGE: ${{ github.event.inputs.scrape_all_per_page }}
           MAX_PROFILES: ${{ github.event.inputs.max_profiles }}
-          CONCURRENCY: ${{ github.event.inputs.concurrency }}
           START_PAGE: ${{ github.event.inputs.start_page }}
           SHEET_NAME: ${{ github.event.inputs.sheet_name }}
           PYTHONUNBUFFERED: "1"
         run: |
-          python -u << 'PYEOF'
-          import os
-          import sys
-          import time
-          import re
-          import socket
-          import threading
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-          from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
-          from pathlib import Path
-          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
-          from bs4 import BeautifulSoup
-          import pandas as pd
-          from openpyxl import load_workbook
-          import shutil
+          python -u scrape_parallel.py
 
-          print_lock = threading.Lock()
-
-          def log(msg):
-              ts = time.strftime("%H:%M:%S")
-              with print_lock:
-                  print(f"[{ts}] {msg}", flush=True)
-                  sys.stdout.flush()
-
-          # ------------------------------------------------------------------
-          # Config
-          # ------------------------------------------------------------------
-          LIST_URL = os.environ.get("LIST_URL", "").strip()
-          SCRAPE_ALL_PER_PAGE = os.environ.get("SCRAPE_ALL_PER_PAGE", "false").strip().lower() == "true"
-          MAX_PROFILES = int(os.environ.get("MAX_PROFILES", "50") or "50")
-          CONCURRENCY = max(1, int(os.environ.get("CONCURRENCY", "5") or "5"))
-          START_PAGE = int(os.environ.get("START_PAGE", "1") or "1")
-          SHEET_NAME = (os.environ.get("SHEET_NAME", "Profiles") or "Profiles").strip()
-          DATA_DIR = Path("data")
-          IMAGE_URLS_FILE = DATA_DIR / "image_urls.txt"
-          XLSX_FILE = DATA_DIR / "foodies_profiles.xlsx"
-          OUT_XLSX = Path("foodies_profiles.xlsx")
-          MAX_EMPTY_STREAK = 3
-          MAX_RETRIES_PER_PAGE = 3
-
-          BROWSER_ARGS = [
-              "--disable-blink-features=AutomationControlled",
-              "--no-sandbox",
-              "--disable-dev-shm-usage",
-              "--disable-http2",
-              "--disable-features=IsolateOrigins,site-per-process",
-              "--ignore-certificate-errors",
-              "--disable-web-security",
-          ]
-          USER_AGENT = (
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/122.0.0.0 Safari/537.36"
-          )
-          EXTRA_HEADERS = {
-              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-              "Accept-Language": "en-US,en;q=0.9",
-              "Accept-Encoding": "gzip, deflate, br",
-              "Upgrade-Insecure-Requests": "1",
-              "Sec-Fetch-Dest": "document",
-              "Sec-Fetch-Mode": "navigate",
-              "Sec-Fetch-Site": "none",
-              "Sec-Fetch-User": "?1",
-          }
-          STEALTH_SCRIPT = """
-              Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-              Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-              Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-              window.chrome = { runtime: {} };
-          """
-
-          def new_stealth_page(p):
-              """Launch a fresh browser/context/page with the same stealth config used everywhere."""
-              browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
-              context = browser.new_context(
-                  user_agent=USER_AGENT,
-                  viewport={"width": 1280, "height": 900},
-                  locale="en-US",
-                  extra_http_headers=EXTRA_HEADERS,
-              )
-              context.add_init_script(STEALTH_SCRIPT)
-              page_obj = context.new_page()
-              return browser, context, page_obj
-
-          # ------------------------------------------------------------------
-          # URL validation + diagnostics
-          # ------------------------------------------------------------------
-          log("=" * 60)
-          log("URL & NETWORK DIAGNOSTICS")
-          log("=" * 60)
-          if not LIST_URL:
-              log("ERROR: list_url is empty")
-              raise SystemExit(1)
-          if not LIST_URL.startswith(("http://", "https://")):
-              log(f"ERROR: list_url must start with http:// or https://")
-              log(f" Got: {LIST_URL!r}")
-              raise SystemExit(1)
-          parsed = urlparse(LIST_URL)
-          if not parsed.netloc:
-              log(f"ERROR: list_url has no domain (netloc is empty)")
-              log(f" Got: {LIST_URL!r}")
-              log(" Example of a valid URL: https://www.example.com/masterchef/")
-              raise SystemExit(1)
-          BASE_URL = f"{parsed.scheme}://{parsed.netloc}"
-          log(f" list_url = {LIST_URL}")
-          log(f" BASE_URL = {BASE_URL}")
-          log(f" scrape_all_per_page = {SCRAPE_ALL_PER_PAGE}")
-          log(f" max_profiles = {MAX_PROFILES} (new ones this run, ignored if scrape_all_per_page=True)")
-          log(f" concurrency = {CONCURRENCY} (parallel workers for Phase 2)")
-          log(f" start_page = {START_PAGE}")
-          log(f" sheet_name = {SHEET_NAME}")
-          # DNS check
-          host = parsed.netloc.split(":")[0]
-          try:
-              ips = socket.getaddrinfo(host, None)
-              unique_ips = sorted({item[4][0] for item in ips})
-              log(f" DNS OK → {host} resolves to: {', '.join(unique_ips)}")
-          except socket.gaierror as e:
-              log(f" DNS FAILED for host '{host}': {e}")
-              log(" → Site domain does not exist or DNS is blocked from this runner")
-              log(" → Fix the URL or check if the domain is correct")
-              raise SystemExit(1)
-          # Quick TCP connectivity check (port 443 / 80)
-          port = 443 if parsed.scheme == "https" else 80
-          try:
-              sock = socket.create_connection((host, port), timeout=10)
-              sock.close()
-              log(f" TCP connect to {host}:{port} → OK")
-          except Exception as e:
-              log(f" TCP connect to {host}:{port} FAILED: {type(e).__name__}: {e}")
-              log(" → Possible causes: site down, firewall, GitHub runner IP blocked, or geo-restriction")
-
-          def build_page_url(base: str, page_num: int) -> str:
-              p = urlparse(base)
-              qs = parse_qs(p.query)
-              if page_num <= 1:
-                  qs.pop("page", None)
-              else:
-                  qs["page"] = [str(page_num)]
-              new_query = urlencode(qs, doseq=True)
-              return urlunparse((p.scheme, p.netloc, p.path or "/", p.params, new_query, p.fragment))
-
-          # ------------------------------------------------------------------
-          # Load already-known image URLs
-          # ------------------------------------------------------------------
-          known_image_urls = set()
-          if IMAGE_URLS_FILE.exists():
-              with open(IMAGE_URLS_FILE, "r", encoding="utf-8") as f:
-                  for line in f:
-                      u = line.strip()
-                      if u:
-                          known_image_urls.add(u)
-          log(f" Loaded {len(known_image_urls)} known image URLs (will skip matches)")
-          known_urls_lock = threading.Lock()
-
-          profile_urls = []
-          seen_ids = set()
-          page = START_PAGE
-          empty_pages_streak = 0
-
-          def cap_reached():
-              return (not SCRAPE_ALL_PER_PAGE) and len(profile_urls) >= MAX_PROFILES
-
-          log("=" * 60)
-          log("PHASE 1: Collect profile URLs from list pages")
-          log("=" * 60)
-          with sync_playwright() as p:
-              log("Launching Playwright + Chromium (HTTP/2 disabled + stealth) ...")
-              browser, context, page_obj = new_stealth_page(p)
-              log(" Chromium launched, browser context + page ready")
-              page_obj.on("console", lambda msg: log(f" [browser] {msg.type}: {msg.text}"))
-              page_obj.on("pageerror", lambda err: log(f" [page error] {err}"))
-              page_obj.on("requestfailed", lambda req: log(
-                  f" [req failed] {req.url[:100]} → {req.failure}"
-              ))
-              # ========== PHASE 1 ==========
-              while not cap_reached():
-                  url = build_page_url(LIST_URL, page)
-                  log("-" * 50)
-                  log(f"LIST PAGE {page} → {url}")
-                  log(f" collected so far: {len(profile_urls)}" + ("" if SCRAPE_ALL_PER_PAGE else f" / {MAX_PROFILES}"))
-                  success = False
-                  last_error = None
-                  for attempt in range(1, MAX_RETRIES_PER_PAGE + 1):
-                      try:
-                          log(f" → goto() attempt {attempt}/{MAX_RETRIES_PER_PAGE} ...")
-                          t0 = time.time()
-                          resp = page_obj.goto(url, wait_until="domcontentloaded", timeout=60000)
-                          elapsed = time.time() - t0
-                          status = resp.status if resp else "N/A"
-                          log(f" → goto done in {elapsed:.1f}s | HTTP status = {status}")
-                          if resp and resp.status >= 400:
-                              log(f" ✗ HTTP error status {resp.status}")
-                              if resp.status in (403, 429, 503):
-                                  log(" → Possible IP block / rate-limit / bot protection")
-                              last_error = f"HTTP {resp.status}"
-                              if attempt < MAX_RETRIES_PER_PAGE:
-                                  time.sleep(3 * attempt)
-                                  continue
-                              break
-                          # soft wait + scrolls
-                          page_obj.wait_for_timeout(2000)
-                          page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                          page_obj.wait_for_timeout(800)
-                          page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                          page_obj.wait_for_timeout(1200)
-                          html = page_obj.content()
-                          log(f" → HTML length: {len(html)}")
-                          success = True
-                          break
-                      except PlaywrightTimeout as e:
-                          last_error = f"Timeout: {e}"
-                          log(f" ✗ attempt {attempt} TIMEOUT: {e}")
-                      except Exception as e:
-                          last_error = f"{type(e).__name__}: {e}"
-                          log(f" ✗ attempt {attempt} failed: {last_error}")
-                          err_str = str(e).lower()
-                          if "err_http2_protocol_error" in err_str or "http2" in err_str:
-                              log(" → HTTP/2 protocol error (common with bot protection or bad CDN)")
-                          elif "err_connection_refused" in err_str:
-                              log(" → Connection refused – site may be down or blocking this IP")
-                          elif "err_name_not_resolved" in err_str or "dns" in err_str:
-                              log(" → DNS failure – domain does not resolve")
-                          elif "err_connection_timed_out" in err_str or "timeout" in err_str:
-                              log(" → Connection timeout – network issue or site very slow / blocked")
-                          elif "err_ssl" in err_str or "certificate" in err_str:
-                              log(" → SSL/TLS problem")
-                          elif "net::err_" in err_str:
-                              log(f" → Chromium network error: {e}")
-                      if attempt < MAX_RETRIES_PER_PAGE:
-                          wait = 2 * attempt
-                          log(f" waiting {wait}s before retry ...")
-                          time.sleep(wait)
-                  if not success:
-                      log(f" All {MAX_RETRIES_PER_PAGE} attempts failed for page {page}")
-                      log(f" Last error: {last_error}")
-                      empty_pages_streak += 1
-                      if empty_pages_streak >= MAX_EMPTY_STREAK:
-                          log(f" {MAX_EMPTY_STREAK} consecutive failures → stop Phase 1")
-                          log(" Possible reasons:")
-                          log(" • Site is blocking GitHub Actions IPs")
-                          log(" • Domain is wrong / site is down")
-                          log(" • Strong bot protection (Cloudflare, etc.)")
-                          log(" • Network / HTTP2 issues from the runner")
-                          break
-                      page += 1
-                      continue
-                  # ----- parse links -----
-                  soup = BeautifulSoup(html, "lxml")
-                  title = (soup.title.string or "(no title)").strip() if soup.title else "(no title)"
-                  log(f" Page title: {title}")
-                  links = soup.select("div.grid_item a[href*='/profile/']")
-                  log(f" selector 'div.grid_item a[href*=\"/profile/\"]' → {len(links)}")
-                  if not links:
-                      links = soup.select("a[href*='/profile/?id=']")
-                      log(f" fallback 'a[href*=\"/profile/?id=\"]' → {len(links)}")
-                  if not links:
-                      links = soup.select("a[data-slug]")
-                      log(f" fallback 'a[data-slug]' → {len(links)}")
-                  if not links:
-                      links = soup.select("a[href*='profile']")
-                      log(f" fallback 'a[href*=\"profile\"]' → {len(links)}")
-                  if not links:
-                      body_preview = (soup.body.get_text(" ", strip=True)[:300] if soup.body else "")
-                      log(f" Body text preview: {body_preview!r}")
-                      sample = soup.select("div[class]")[:12]
-                      log(" Sample div classes:")
-                      for d in sample:
-                          log(f" class=\"{' '.join(d.get('class', []))}\"")
-                      paginator = soup.select_one("div.paginator")
-                      log(f" paginator present: {bool(paginator)}")
-                      lower_body = body_preview.lower()
-                      if any(x in lower_body for x in ["cloudflare", "attention required", "just a moment", "access denied", "blocked"]):
-                          log(" !!! Looks like a Cloudflare / bot-protection / access-denied page")
-                      if "captcha" in lower_body:
-                          log(" !!! CAPTCHA detected")
-                      empty_pages_streak += 1
-                      if empty_pages_streak >= MAX_EMPTY_STREAK:
-                          log(f" No usable links for {MAX_EMPTY_STREAK} pages → stop Phase 1")
-                          break
-                      page += 1
-                      continue
-                  new = 0
-                  for a in links:
-                      if cap_reached():
-                          break
-                      href = a.get("href") or ""
-                      if not href:
-                          continue
-                      full = urljoin(BASE_URL, href)
-                      m = re.search(r"[?&]id=([^&]+)", full) or re.search(r"/profile/([^/?]+)", full)
-                      pid = m.group(1) if m else full
-                      if pid in seen_ids:
-                          continue
-                      seen_ids.add(pid)
-                      profile_urls.append(full)
-                      new += 1
-                      if new <= 5 or new % 10 == 0:
-                          log(f" + profile URL [{len(profile_urls)}]: {full}")
-                  log(f" Added {new} new URLs this page (all of them, since scrape_all_per_page={SCRAPE_ALL_PER_PAGE}) → total unique: {len(profile_urls)}")
-                  if new == 0:
-                      empty_pages_streak += 1
-                      log(f" No new profile URLs this page (streak={empty_pages_streak})")
-                      if empty_pages_streak >= MAX_EMPTY_STREAK:
-                          log(f" {MAX_EMPTY_STREAK} consecutive pages with no new data → stop Phase 1")
-                          break
-                  else:
-                      empty_pages_streak = 0
-                  # next page detection
-                  next_link = soup.select_one(
-                      "div.paginator a.next, a.next.pill, a[aria-label='Next page'], a[title='Next page']"
-                  )
-                  has_next = bool(next_link and next_link.get("href"))
-                  log(f" next_link present: {has_next}")
-                  if not has_next:
-                      page_links = soup.select("div.paginator a[href*='page='], a.pill[href*='page=']")
-                      if page_links:
-                          try:
-                              nums = [
-                                  int(re.search(r"page=(\d+)", a.get("href", "")).group(1))
-                                  for a in page_links if re.search(r"page=(\d+)", a.get("href", ""))
-                              ]
-                              max_p = max(nums) if nums else page
-                              log(f" highest page num found: {max_p}")
-                              if page < max_p:
-                                  has_next = True
-                          except Exception as e:
-                              log(f" page-num parse error: {e}")
-                  if not has_next:
-                      log(" No more list pages.")
-                      break
-                  page += 1
-                  time.sleep(1.0)
-              log("=" * 60)
-              log(f"PHASE 1 DONE → {len(profile_urls)} profile URLs collected")
-              log("=" * 60)
-              log("Closing Phase 1 browser ...")
-              browser.close()
-              log("Phase 1 browser closed")
-
-          # ------------------------------------------------------------------
-          # PHASE 2: Parallel profile scraping
-          # Each worker owns its own Playwright/browser instance (sync API is
-          # not thread-safe, so browsers are never shared across threads) and
-          # works through its own slice of profile_urls sequentially.
-          # ------------------------------------------------------------------
-          def extract_profile(soup, purl):
-              title = (soup.title.string or "").strip() if soup.title else ""
-              full_name = ""
-              for sel in [
-                  "h1", "h1.name", "h1.profile-name", ".profile-name", ".full-name",
-                  ".card-title", "[class*='name']", "h2", "h3",
-              ]:
-                  el = soup.select_one(sel)
-                  if el:
-                      t = el.get_text(strip=True)
-                      if t and len(t) < 120:
-                          full_name = t
-                          break
-              if not full_name and title:
-                  full_name = title.split("|")[0].split("-")[0].strip()
-              about = ""
-              for sel in [
-                  ".about", ".bio", ".description", ".profile-about", ".profile-bio",
-                  "[class*='about']", "[class*='bio']", "[class*='description']",
-                  ".card-body p", "section p", "article p", "p",
-              ]:
-                  els = soup.select(sel)
-                  for el in els:
-                      t = el.get_text(" ", strip=True)
-                      t = re.sub(r"\s+", " ", t).strip()
-                      if 20 < len(t) < 2000:
-                          about = t
-                          break
-                  if about:
-                      break
-              image_url = ""
-              for sel in [
-                  "img.profile-image", "img.avatar", "img[class*='profile']",
-                  "img[class*='avatar']", "img[class*='photo']",
-                  "meta[property='og:image']", "meta[name='twitter:image']",
-                  "img",
-              ]:
-                  if sel.startswith("meta"):
-                      el = soup.select_one(sel)
-                      if el and el.get("content"):
-                          image_url = urljoin(BASE_URL, el["content"])
-                          break
-                  else:
-                      for img in soup.select(sel):
-                          src = (
-                              img.get("src")
-                              or img.get("data-src")
-                              or img.get("data-lazy-src")
-                              or img.get("data-original")
-                              or ""
-                          )
-                          if (src and not src.startswith("data:")
-                                  and "icon" not in src.lower()
-                                  and "logo" not in src.lower()):
-                              image_url = urljoin(BASE_URL, src)
-                              break
-                  if image_url:
-                      break
-              return full_name, about, image_url
-
-          def worker_scrape(chunk, worker_id):
-              local_results = []
-              local_dups = 0
-              if not chunk:
-                  return local_results, local_dups
-              with sync_playwright() as p:
-                  browser, context, page_obj = new_stealth_page(p)
-                  log(f"[W{worker_id}] browser ready, {len(chunk)} profiles assigned")
-                  for i, purl in enumerate(chunk, 1):
-                      log(f"[W{worker_id}] {i}/{len(chunk)} → {purl}")
-                      try:
-                          t0 = time.time()
-                          resp = page_obj.goto(purl, wait_until="domcontentloaded", timeout=45000)
-                          log(f"[W{worker_id}]  goto done in {time.time()-t0:.1f}s | status={resp.status if resp else 'N/A'}")
-                          page_obj.wait_for_timeout(1800)
-                          page_obj.evaluate("window.scrollTo(0, 400)")
-                          page_obj.wait_for_timeout(700)
-                          html = page_obj.content()
-                      except Exception as e:
-                          log(f"[W{worker_id}]  ✗ ERROR loading profile: {type(e).__name__}: {e}")
-                          local_results.append({
-                              "image_url": "",
-                              "full_name": "",
-                              "about": f"ERROR: {e}",
-                              "profile_url": purl,
-                          })
-                          continue
-                      soup = BeautifulSoup(html, "lxml")
-                      full_name, about, image_url = extract_profile(soup, purl)
-                      if image_url:
-                          with known_urls_lock:
-                              if image_url in known_image_urls:
-                                  log(f"[W{worker_id}]  ⏭ SKIP duplicate image_url: {image_url[:80]}...")
-                                  local_dups += 1
-                                  continue
-                              known_image_urls.add(image_url)
-                      local_results.append({
-                          "image_url": image_url,
-                          "full_name": full_name,
-                          "about": about,
-                          "profile_url": purl,
-                      })
-                      log(f"[W{worker_id}]  ✓ saved: name={full_name[:40]!r} | img={bool(image_url)} | about_len={len(about)}")
-                      time.sleep(0.5)
-                  browser.close()
-              return local_results, local_dups
-
-          def chunk_list(lst, n):
-              if n <= 0:
-                  return [lst]
-              k, m = divmod(len(lst), n)
-              return [lst[i*k+min(i, m):(i+1)*k+min(i+1, m)] for i in range(n)]
-
-          results = []
-          if not profile_urls:
-              log("No profile URLs found. Will still save / upload existing state.")
-          else:
-              workers_needed = min(CONCURRENCY, len(profile_urls))
-              log("=" * 60)
-              log(f"PHASE 2: Visit profile pages in parallel ({workers_needed} workers)")
-              log("=" * 60)
-              chunks = chunk_list(profile_urls, workers_needed)
-              total_dups = 0
-              with ThreadPoolExecutor(max_workers=workers_needed) as executor:
-                  futures = {
-                      executor.submit(worker_scrape, chunk, idx + 1): idx
-                      for idx, chunk in enumerate(chunks)
-                  }
-                  for fut in as_completed(futures):
-                      chunk_results, chunk_dups = fut.result()
-                      results.extend(chunk_results)
-                      total_dups += chunk_dups
-              log(f"PHASE 2 DONE → {len(results)} new profiles, {total_dups} duplicates skipped")
-
-          # ------------------------------------------------------------------
-          # Persist image_urls.txt
-          # ------------------------------------------------------------------
-          DATA_DIR.mkdir(parents=True, exist_ok=True)
-          with open(IMAGE_URLS_FILE, "w", encoding="utf-8") as f:
-              for u in sorted(known_image_urls):
-                  f.write(u + "\n")
-          log(f"Wrote {len(known_image_urls)} image URLs → {IMAGE_URLS_FILE}")
-
-          # ------------------------------------------------------------------
-          # Append / create Excel sheet (single write, after all scraping is done)
-          # ------------------------------------------------------------------
-          new_df = pd.DataFrame(results, columns=["image_url", "full_name", "about", "profile_url"])
-          log(f"New rows this run: {len(new_df)}")
-          if XLSX_FILE.exists():
-              try:
-                  book = load_workbook(XLSX_FILE)
-                  if SHEET_NAME in book.sheetnames:
-                      log(f"Sheet '{SHEET_NAME}' already exists → will append")
-                      existing = pd.read_excel(XLSX_FILE, sheet_name=SHEET_NAME, engine="openpyxl")
-                      combined = pd.concat([existing, new_df], ignore_index=True)
-                      combined = combined.drop_duplicates(subset=["image_url", "profile_url"], keep="first")
-                  else:
-                      log(f"Sheet '{SHEET_NAME}' does not exist → create new")
-                      combined = new_df
-                  with pd.ExcelWriter(XLSX_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-                      if SHEET_NAME in writer.book.sheetnames:
-                          idx = writer.book.sheetnames.index(SHEET_NAME)
-                          writer.book.remove(writer.book.worksheets[idx])
-                      combined.to_excel(writer, sheet_name=SHEET_NAME, index=False)
-                  log(f"Updated sheet '{SHEET_NAME}' → total rows now {len(combined)}")
-              except Exception as e:
-                  log(f"Excel append error: {e} → creating fresh file")
-                  new_df.to_excel(XLSX_FILE, sheet_name=SHEET_NAME, index=False, engine="openpyxl")
-          else:
-              log(f"No previous xlsx → creating new with sheet '{SHEET_NAME}'")
-              new_df.to_excel(XLSX_FILE, sheet_name=SHEET_NAME, index=False, engine="openpyxl")
-          shutil.copy(XLSX_FILE, OUT_XLSX)
-          log(f"Saved {OUT_XLSX} (and {XLSX_FILE})")
-          if not new_df.empty:
-              log("First 5 new rows:")
-              print(new_df.head(5).to_string(), flush=True)
-          else:
-              log("No new rows this run (all duplicates or nothing found).")
-          log("=" * 60)
-          log(f"SCRAPE FINISHED → {len(results)} new profiles")
-          log("=" * 60)
-          PYEOF
-      - name: Upload results to Mega.nz (single final upload)
+      - name: Upload results to Mega.nz
         run: |
-          echo "=== Uploading to mega:foodies-scrape/ (once, after scraping is fully complete) ==="
+          echo "=== Uploading to mega:foodies-scrape/ ==="
           rclone mkdir mega:foodies-scrape || true
           rclone copy data/image_urls.txt mega:foodies-scrape/ --progress
           rclone copy data/foodies_profiles.xlsx mega:foodies-scrape/ --progress
           echo "=== Upload done ==="
           rclone ls mega:foodies-scrape/
+
       - name: Upload XLSX artifact (GitHub)
         uses: actions/upload-artifact@v4
         with:
@@ -640,28 +110,3 @@ jobs:
             data/image_urls.txt
           retention-days: 30
           if-no-files-found: warn
-      - name: Summary
-        run: |
-          echo "### Scrape complete" >> $GITHUB_STEP_SUMMARY
-          echo "- **URL**: ${{ github.event.inputs.list_url }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Scrape all per page**: ${{ github.event.inputs.scrape_all_per_page }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Max new profiles (if not scrape-all)**: ${{ github.event.inputs.max_profiles }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Concurrency**: ${{ github.event.inputs.concurrency }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Start page**: ${{ github.event.inputs.start_page }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Sheet / tab name**: ${{ github.event.inputs.sheet_name }}" >> $GITHUB_STEP_SUMMARY
-          if [ -f foodies_profiles.xlsx ]; then
-            echo "- **Artifact**: foodies_profiles.xlsx + image_urls.txt uploaded" >> $GITHUB_STEP_SUMMARY
-            python -c "
-          import pandas as pd
-          from openpyxl import load_workbook
-          wb = load_workbook('foodies_profiles.xlsx')
-          print(f'- **Sheets**: {wb.sheetnames}')
-          sheet = '${{ github.event.inputs.sheet_name }}'
-          if sheet in wb.sheetnames:
-              df = pd.read_excel('foodies_profiles.xlsx', sheet_name=sheet)
-              print(f'- **Rows in sheet \"{sheet}\":** {len(df)}')
-          " >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- **No xlsx produced**" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "- **Mega.nz**: uploaded once to mega:foodies-scrape/ at the end" >> $GITHUB_STEP_SUMMARY
