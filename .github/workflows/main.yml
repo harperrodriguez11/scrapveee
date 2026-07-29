@@ -650,6 +650,14 @@ jobs:
                   if t and t.lower() not in GENERIC_TITLES:
                       full_name = t.split("|")[0].split("-")[0].strip()
 
+              # last-resort image fallback: scan the raw HTML for any CDN image
+              # URL under img.foodies.com near the card-image area, in case the
+              # <img> attribute name/structure differs slightly per profile.
+              if not image_url:
+                  m_img = re.search(r'https?://img\.foodies\.com/[^\s"\'<>]+', html)
+                  if m_img:
+                      image_url = m_img.group(0)
+
               # --- about from <div class="desc"><div class="subtitle">About:</div><p>...</p></div> ---
               about = ""
               desc_p = soup.select_one("div.desc p")
@@ -661,12 +669,23 @@ jobs:
                       about = desc_container.get_text(" ", strip=True)
               about = re.sub(r"^About:\s*", "", about, flags=re.I).strip()
 
-              # last-resort: hunt for "About: ..." anywhere in the rendered text
+              # last-resort: any <p> tag that sits right after a "subtitle"-ish
+              # element whose text says "About", regardless of container class
+              if not about:
+                  for subtitle in soup.find_all(string=re.compile(r"^\s*About:?\s*$", re.I)):
+                      parent = subtitle.parent
+                      candidate = parent.find_next("p") if parent else None
+                      if candidate:
+                          about = candidate.get_text(" ", strip=True)
+                          break
+
+              # absolute last resort: search rendered text for "About:" and take
+              # a bounded chunk after it (not the entire rest of the page)
               if not about:
                   text = soup.get_text(" ", strip=True)
-                  m2 = re.search(r"About:\s*(.+?)(?:$)", text)
+                  m2 = re.search(r"About:\s*(.{1,400}?)(?:\s{2,}|$)", text)
                   if m2:
-                      about = m2.group(1).strip()[:800]
+                      about = m2.group(1).strip()
 
               return full_name, about, image_url
 
@@ -685,9 +704,13 @@ jobs:
                       load_error = None
                       # Up to 2 tries: the site is client-rendered, so a bare
                       # domcontentloaded snapshot can catch an empty shell.
-                      # Wait for one of the real content elements to actually
-                      # appear before reading page.content(); reload once and
-                      # retry if it never shows up.
+                      # IMPORTANT: wait for the image AND the about block
+                      # INDEPENDENTLY. A single wait_for_selector with several
+                      # comma-separated selectors resolves as soon as ANY ONE
+                      # of them appears — #Chef-card (name) renders first and
+                      # was satisfying the wait before div.card-image/div.desc
+                      # had actually loaded, which is why name worked but
+                      # image/about kept coming back empty.
                       for load_attempt in range(1, 3):
                           try:
                               t0 = time.time()
@@ -698,16 +721,24 @@ jobs:
                               except PlaywrightTimeout:
                                   log(f"[W{worker_id}]  (networkidle wait timed out, continuing anyway)")
                               page_obj.evaluate("window.scrollTo(0, 400)")
+
+                              img_ready = True
+                              desc_ready = True
                               try:
-                                  page_obj.wait_for_selector(
-                                      "div.card-image, div.desc, #Chef-card",
-                                      timeout=15000,
-                                  )
+                                  page_obj.wait_for_selector("div.card-image img[src]", timeout=15000)
                               except PlaywrightTimeout:
-                                  log(f"[W{worker_id}]  ⚠ content selectors not found within 15s (attempt {load_attempt})")
-                                  if load_attempt == 1:
-                                      log(f"[W{worker_id}]  reloading and retrying once ...")
-                                      continue
+                                  img_ready = False
+                                  log(f"[W{worker_id}]  ⚠ div.card-image img[src] not ready within 15s (attempt {load_attempt})")
+                              try:
+                                  page_obj.wait_for_selector("div.desc p, div.desc", timeout=10000)
+                              except PlaywrightTimeout:
+                                  desc_ready = False
+                                  log(f"[W{worker_id}]  ⚠ div.desc not ready within 10s (attempt {load_attempt})")
+
+                              if not (img_ready and desc_ready) and load_attempt == 1:
+                                  log(f"[W{worker_id}]  reloading and retrying once ...")
+                                  continue
+
                               page_obj.wait_for_timeout(PROFILE_WAIT_MS)
                               html = page_obj.content()
                               load_error = None
