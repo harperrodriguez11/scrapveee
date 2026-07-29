@@ -1,0 +1,384 @@
+name: Scrape Foodies Profiles Claude
+
+on:
+  workflow_dispatch:
+    inputs:
+      list_url:
+        description: 'Main list URL (e.g. https://foodies.com/food/ or https://www.foodies.com/foods/)'
+        required: true
+        default: 'https://foodies.com/food/'
+        type: string
+      max_profiles:
+        description: 'Maximum number of NEW profiles to scrape this run (e.g. 50)'
+        required: true
+        default: '50'
+        type: string
+      start_page:
+        description: 'Starting page number'
+        required: false
+        default: '1'
+        type: string
+      concurrency:
+        description: 'How many profile pages to scrape at once per list page'
+        required: false
+        default: '6'
+        type: string
+      mega_remote_dir:
+        description: 'Folder on Mega to store xlsx + profiles_urls.txt'
+        required: false
+        default: 'foodies-scrape'
+        type: string
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          echo "=== Installing Python packages ==="
+          python -m pip install --upgrade pip
+          pip install playwright pandas openpyxl beautifulsoup4 lxml
+          echo "=== Installing Chromium for Playwright ==="
+          playwright install chromium --with-deps
+          echo "=== Dependencies ready ==="
+
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Configure rclone for Mega (from secrets, obscured at runtime)
+        env:
+          MEGA_USER: ${{ secrets.MEGA_USER }}
+          MEGA_PASS: ${{ secrets.MEGA_PASS }}
+        run: |
+          if [ -z "$MEGA_USER" ] || [ -z "$MEGA_PASS" ]; then
+            echo "::error::MEGA_USER / MEGA_PASS secrets are not set. Add them under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          mkdir -p ~/.config/rclone
+          OBSCURED_PASS=$(rclone obscure "$MEGA_PASS")
+          cat > ~/.config/rclone/rclone.conf << EOF
+          [mega]
+          type = mega
+          user = ${MEGA_USER}
+          pass = ${OBSCURED_PASS}
+          EOF
+          echo "rclone configured (credentials not printed)"
+
+      - name: Pull existing profiles_urls.txt from Mega (for dedup)
+        env:
+          MEGA_DIR: ${{ github.event.inputs.mega_remote_dir }}
+        run: |
+          mkdir -p state
+          if rclone copyto "mega:${MEGA_DIR}/profiles_urls.txt" "state/profiles_urls.txt" 2>/tmp/rclone_pull.log; then
+            echo "Pulled existing profiles_urls.txt ($(wc -l < state/profiles_urls.txt) known URLs)"
+          else
+            echo "No existing profiles_urls.txt on Mega yet (or pull failed) — starting fresh."
+            cat /tmp/rclone_pull.log || true
+            touch state/profiles_urls.txt
+          fi
+
+      - name: Scrape profiles (concurrent per page) and generate XLSX
+        env:
+          LIST_URL: ${{ github.event.inputs.list_url }}
+          MAX_PROFILES: ${{ github.event.inputs.max_profiles }}
+          START_PAGE: ${{ github.event.inputs.start_page }}
+          CONCURRENCY: ${{ github.event.inputs.concurrency }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python -u << 'PYEOF'
+          import os, sys, time, re, asyncio
+          from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
+          from playwright.async_api import async_playwright
+          from bs4 import BeautifulSoup
+          import pandas as pd
+
+          def log(msg):
+              ts = time.strftime("%H:%M:%S")
+              print(f"[{ts}] {msg}", flush=True)
+
+          LIST_URL = os.environ.get("LIST_URL", "").strip()
+          MAX_PROFILES = int(os.environ.get("MAX_PROFILES", "50"))
+          START_PAGE = int(os.environ.get("START_PAGE", "1"))
+          CONCURRENCY = max(1, int(os.environ.get("CONCURRENCY", "6")))
+
+          parsed = urlparse(LIST_URL)
+          BASE_URL = f"{parsed.scheme}://{parsed.netloc}"
+
+          # ---- load already-scraped URLs for dedup ----
+          SEEN_URLS_FILE = "state/profiles_urls.txt"
+          seen_urls = set()
+          if os.path.exists(SEEN_URLS_FILE):
+              with open(SEEN_URLS_FILE, "r", encoding="utf-8") as f:
+                  for line in f:
+                      line = line.strip()
+                      if line:
+                          seen_urls.add(line)
+          log(f"Loaded {len(seen_urls)} previously-scraped profile URLs for dedup")
+
+          def build_page_url(base: str, page_num: int) -> str:
+              p = urlparse(base)
+              qs = parse_qs(p.query)
+              if page_num <= 1:
+                  qs.pop("page", None)
+              else:
+                  qs["page"] = [str(page_num)]
+              new_query = urlencode(qs, doseq=True)
+              return urlunparse((p.scheme, p.netloc, p.path or "/", p.params, new_query, p.fragment))
+
+          def extract_links(html):
+              soup = BeautifulSoup(html, "lxml")
+              title = (soup.title.string or "(no title)").strip() if soup.title else "(no title)"
+              links = soup.select("div.grid_item a[href*='/profile/']")
+              tag = "div.grid_item a[href*='/profile/']"
+              if not links:
+                  links = soup.select("a[href*='/profile/?id=']"); tag = "a[href*='/profile/?id=']"
+              if not links:
+                  links = soup.select("a[data-slug]"); tag = "a[data-slug]"
+              if not links:
+                  links = soup.select("a[href*='profile']"); tag = "a[href*='profile']"
+              return soup, title, links, tag
+
+          def has_next_page(soup, current_page):
+              next_link = soup.select_one(
+                  "div.paginator a.next, a.next.pill, a[aria-label='Next page'], a[title='Next page']"
+              )
+              if next_link and next_link.get("href"):
+                  return True
+              page_links = soup.select("div.paginator a[href*='page='], a.pill[href*='page=']")
+              if page_links:
+                  nums = []
+                  for a in page_links:
+                      m = re.search(r"page=(\d+)", a.get("href", ""))
+                      if m:
+                          nums.append(int(m.group(1)))
+                  if nums and current_page < max(nums):
+                      return True
+              return False
+
+          def parse_profile(html, purl):
+              soup = BeautifulSoup(html, "lxml")
+              title = (soup.title.string or "").strip() if soup.title else ""
+
+              full_name = ""
+              for sel in ["h1", "h1.name", "h1.profile-name", ".profile-name", ".full-name",
+                          ".card-title", "[class*='name']", "h2", "h3"]:
+                  el = soup.select_one(sel)
+                  if el:
+                      t = el.get_text(strip=True)
+                      if t and len(t) < 120:
+                          full_name = t
+                          break
+              if not full_name and title:
+                  full_name = title.split("|")[0].split("-")[0].strip()
+
+              about = ""
+              for sel in [".about", ".bio", ".description", ".profile-about", ".profile-bio",
+                          "[class*='about']", "[class*='bio']", "[class*='description']",
+                          ".card-body p", "section p", "article p", "p"]:
+                  for el in soup.select(sel):
+                      t = re.sub(r"\s+", " ", el.get_text(" ", strip=True)).strip()
+                      if 20 < len(t) < 2000:
+                          about = t
+                          break
+                  if about:
+                      break
+
+              image_url = ""
+              for sel in ["img.profile-image", "img.avatar", "img[class*='profile']",
+                          "img[class*='avatar']", "img[class*='photo']",
+                          "meta[property='og:image']", "meta[name='twitter:image']", "img"]:
+                  if sel.startswith("meta"):
+                      el = soup.select_one(sel)
+                      if el and el.get("content"):
+                          image_url = urljoin(BASE_URL, el["content"])
+                          break
+                  else:
+                      for img in soup.select(sel):
+                          src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or img.get("data-original") or ""
+                          if src and not src.startswith("data:") and "icon" not in src.lower() and "logo" not in src.lower():
+                              image_url = urljoin(BASE_URL, src)
+                              break
+                  if image_url:
+                      break
+
+              return {"image_url": image_url, "full_name": full_name, "about": about, "profile_url": purl}
+
+          async def scrape_one_profile(context, purl, sem, idx, total):
+              async with sem:
+                  pg = await context.new_page()
+                  try:
+                      t0 = time.time()
+                      await pg.goto(purl, wait_until="domcontentloaded", timeout=45000)
+                      await pg.wait_for_timeout(1500)
+                      await pg.evaluate("window.scrollTo(0, 400)")
+                      await pg.wait_for_timeout(500)
+                      html = await pg.content()
+                      row = parse_profile(html, purl)
+                      log(f" [{idx}/{total}] ✓ {time.time()-t0:.1f}s name={row['full_name'][:35]!r} img={bool(row['image_url'])} → {purl}")
+                      return row
+                  except Exception as e:
+                      log(f" [{idx}/{total}] ✗ ERROR {type(e).__name__}: {e} → {purl}")
+                      return {"image_url": "", "full_name": "", "about": f"ERROR: {e}", "profile_url": purl}
+                  finally:
+                      await pg.close()
+
+          async def main():
+              new_profile_urls = []
+              seen_ids = set()
+              page_num = START_PAGE
+              results = []
+
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(
+                      headless=True,
+                      args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+                  )
+                  context = await browser.new_context(
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                      viewport={"width": 1280, "height": 900},
+                      locale="en-US",
+                  )
+                  await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+                  list_page = await context.new_page()
+                  sem = asyncio.Semaphore(CONCURRENCY)
+
+                  log("=" * 60)
+                  log(f"PHASE 1+2 combined, per list page, concurrency={CONCURRENCY}")
+                  log(f" list_url={LIST_URL} max_new_profiles={MAX_PROFILES} start_page={START_PAGE}")
+                  log("=" * 60)
+
+                  while len(new_profile_urls) < MAX_PROFILES:
+                      url = build_page_url(LIST_URL, page_num)
+                      log("-" * 50)
+                      log(f"LIST PAGE {page_num} → {url}")
+                      try:
+                          await list_page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                          await list_page.wait_for_timeout(1500)
+                          await list_page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                          await list_page.wait_for_timeout(600)
+                          await list_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                          await list_page.wait_for_timeout(1000)
+                          html = await list_page.content()
+                      except Exception as e:
+                          log(f" ✗ ERROR on list page {page_num}: {type(e).__name__}: {e}")
+                          break
+
+                      soup, title, links, tag = extract_links(html)
+                      log(f" title={title!r} selector='{tag}' found={len(links)}")
+                      if not links:
+                          log(" No links found on this page → stopping pagination")
+                          break
+
+                      page_batch = []
+                      skipped_dupes = 0
+                      for a in links:
+                          if len(new_profile_urls) + len(page_batch) >= MAX_PROFILES:
+                              break
+                          href = a.get("href") or ""
+                          if not href:
+                              continue
+                          full = urljoin(BASE_URL, href)
+                          m = re.search(r"[?&]id=([^&]+)", full) or re.search(r"/profile/([^/?]+)", full)
+                          pid = m.group(1) if m else full
+                          if pid in seen_ids:
+                              continue
+                          seen_ids.add(pid)
+                          if full in seen_urls:
+                              skipped_dupes += 1
+                              continue
+                          page_batch.append(full)
+
+                      log(f" Page {page_num}: {len(links)} profiles found, {skipped_dupes} already scraped (skipped), {len(page_batch)} new to scrape")
+
+                      if page_batch:
+                          tasks = [
+                              scrape_one_profile(context, purl, sem, i + 1, len(page_batch))
+                              for i, purl in enumerate(page_batch)
+                          ]
+                          page_results = await asyncio.gather(*tasks)
+                          results.extend(page_results)
+                          new_profile_urls.extend(page_batch)
+                          seen_urls.update(page_batch)
+
+                      log(f" Running total new profiles scraped: {len(new_profile_urls)} / {MAX_PROFILES}")
+
+                      if not has_next_page(soup, page_num):
+                          log(" No more list pages.")
+                          break
+                      page_num += 1
+                      await asyncio.sleep(0.5)
+
+                  await browser.close()
+
+              log("=" * 60)
+              log(f"SCRAPE FINISHED → {len(results)} new profiles")
+              log("=" * 60)
+
+              df = pd.DataFrame(results, columns=["image_url", "full_name", "about", "profile_url"])
+              df.to_excel("foodies_profiles.xlsx", index=False, engine="openpyxl")
+              log(f"Saved foodies_profiles.xlsx ({len(df)} rows)")
+
+              # append newly scraped urls to the dedup file
+              with open(SEEN_URLS_FILE, "a", encoding="utf-8") as f:
+                  for u in new_profile_urls:
+                      f.write(u + "\n")
+              log(f"Updated {SEEN_URLS_FILE} → now {len(seen_urls)} total known URLs")
+
+              if not df.empty:
+                  print(df.head(5).to_string(), flush=True)
+
+          asyncio.run(main())
+          PYEOF
+
+      - name: Upload XLSX artifact (GitHub, 30-day retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: foodies-profiles
+          path: |
+            foodies_profiles.xlsx
+            state/profiles_urls.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Push results to Mega (overwrite existing files)
+        env:
+          MEGA_DIR: ${{ github.event.inputs.mega_remote_dir }}
+        run: |
+          TS=$(date +%Y%m%d_%H%M%S)
+          if [ -f foodies_profiles.xlsx ]; then
+            rclone copyto foodies_profiles.xlsx "mega:${MEGA_DIR}/latest/foodies_profiles.xlsx" --progress
+            rclone copyto foodies_profiles.xlsx "mega:${MEGA_DIR}/history/foodies_profiles_${TS}.xlsx" --progress
+            echo "Uploaded foodies_profiles.xlsx to Mega (overwrote latest/, archived a timestamped copy)"
+          fi
+          if [ -f state/profiles_urls.txt ]; then
+            rclone copyto state/profiles_urls.txt "mega:${MEGA_DIR}/profiles_urls.txt" --progress
+            echo "Uploaded updated profiles_urls.txt to Mega (overwritten)"
+          fi
+
+      - name: Summary
+        run: |
+          echo "### Scrape complete" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: ${{ github.event.inputs.list_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Max new profiles requested**: ${{ github.event.inputs.max_profiles }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Start page**: ${{ github.event.inputs.start_page }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Concurrency**: ${{ github.event.inputs.concurrency }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Mega folder**: ${{ github.event.inputs.mega_remote_dir }}" >> $GITHUB_STEP_SUMMARY
+          if [ -f foodies_profiles.xlsx ]; then
+            python -c "import pandas as pd; df=pd.read_excel('foodies_profiles.xlsx'); print(f'- **New rows scraped this run**: {len(df)}')" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **No file produced**" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f state/profiles_urls.txt ]; then
+            echo "- **Total known profile URLs (all-time)**: $(wc -l < state/profiles_urls.txt)" >> $GITHUB_STEP_SUMMARY
+          fi
