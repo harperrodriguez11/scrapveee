@@ -1,4 +1,4 @@
-name: Scrape Foodies Profiles
+name: Scrape Foodies Profiles Claude
 
 on:
   workflow_dispatch:
@@ -27,6 +27,11 @@ on:
         description: 'Folder on Mega to store xlsx + profiles_urls.txt'
         required: false
         default: 'foodies-scrape'
+        type: string
+      strip_terms:
+        description: 'Words/phrases to remove from full_name and about, separated by | (e.g. Sponsored|Verified|Click here)'
+        required: false
+        default: ''
         type: string
 
 jobs:
@@ -93,6 +98,7 @@ jobs:
           MAX_PROFILES: ${{ github.event.inputs.max_profiles }}
           START_PAGE: ${{ github.event.inputs.start_page }}
           CONCURRENCY: ${{ github.event.inputs.concurrency }}
+          STRIP_TERMS: ${{ github.event.inputs.strip_terms }}
           PYTHONUNBUFFERED: "1"
         run: |
           python -u << 'PYEOF'
@@ -110,6 +116,8 @@ jobs:
           MAX_PROFILES = int(os.environ.get("MAX_PROFILES", "50"))
           START_PAGE = int(os.environ.get("START_PAGE", "1"))
           CONCURRENCY = max(1, int(os.environ.get("CONCURRENCY", "6")))
+          STRIP_TERMS_RAW = os.environ.get("STRIP_TERMS", "")
+          STRIP_TERMS = [t.strip() for t in STRIP_TERMS_RAW.split("|") if t.strip()]
 
           parsed = urlparse(LIST_URL)
           BASE_URL = f"{parsed.scheme}://{parsed.netloc}"
@@ -124,6 +132,8 @@ jobs:
                       if line:
                           seen_urls.add(line)
           log(f"Loaded {len(seen_urls)} previously-scraped profile URLs for dedup")
+          if STRIP_TERMS:
+              log(f"Will strip {len(STRIP_TERMS)} term(s) from full_name/about: {STRIP_TERMS}")
 
           def build_page_url(base: str, page_num: int) -> str:
               p = urlparse(base)
@@ -213,6 +223,47 @@ jobs:
 
               return {"image_url": image_url, "full_name": full_name, "about": about, "profile_url": purl}
 
+          # Some sites inject the display name purely via CSS (e.g. #model-card .card-title::before
+          # { content: "FULL NAME"; }) rather than as HTML text, so BeautifulSoup never sees it.
+          # This reads the actual computed style in the rendered page, the same value a visitor sees on screen.
+          CSS_NAME_SELECTORS = [
+              "#model-card .card-title",
+              ".card-title",
+              ".profile-name",
+              ".full-name",
+          ]
+
+          async def get_name_from_css_before(pg):
+              try:
+                  name = await pg.evaluate(
+                      """(selectors) => {
+                          for (const sel of selectors) {
+                              const el = document.querySelector(sel);
+                              if (!el) continue;
+                              for (const pseudo of ['::before', '::after']) {
+                                  const content = window.getComputedStyle(el, pseudo).content;
+                                  if (content && content !== 'none' && content !== 'normal' && content !== '""') {
+                                      return content.replace(/^["']|["']$/g, '').trim();
+                                  }
+                              }
+                          }
+                          return null;
+                      }""",
+                      CSS_NAME_SELECTORS,
+                  )
+                  return (name or "").strip()
+              except Exception:
+                  return ""
+
+          def strip_terms_from_text(text, terms):
+              if not text or not terms:
+                  return text
+              out = text
+              for term in terms:
+                  out = re.sub(re.escape(term), "", out, flags=re.IGNORECASE)
+              out = re.sub(r"\s+", " ", out).strip(" \t-–—:,.")
+              return out
+
           async def scrape_one_profile(context, purl, sem, idx, total):
               async with sem:
                   pg = await context.new_page()
@@ -224,7 +275,15 @@ jobs:
                       await pg.wait_for_timeout(500)
                       html = await pg.content()
                       row = parse_profile(html, purl)
-                      log(f" [{idx}/{total}] ✓ {time.time()-t0:.1f}s name={row['full_name'][:35]!r} img={bool(row['image_url'])} → {purl}")
+                      # CSS-injected name takes priority over whatever static HTML parsing found,
+                      # since on this site the real name only exists as a ::before content value.
+                      css_name = await get_name_from_css_before(pg)
+                      if css_name:
+                          row["full_name"] = css_name
+                      row["full_name"] = strip_terms_from_text(row["full_name"], STRIP_TERMS)
+                      row["about"] = strip_terms_from_text(row["about"], STRIP_TERMS)
+                      row_source = "css" if css_name else "html"
+                      log(f" [{idx}/{total}] ✓ {time.time()-t0:.1f}s name({row_source})={row['full_name'][:35]!r} img={bool(row['image_url'])} → {purl}")
                       return row
                   except Exception as e:
                       log(f" [{idx}/{total}] ✗ ERROR {type(e).__name__}: {e} → {purl}")
@@ -373,6 +432,7 @@ jobs:
           echo "- **Start page**: ${{ github.event.inputs.start_page }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Concurrency**: ${{ github.event.inputs.concurrency }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Mega folder**: ${{ github.event.inputs.mega_remote_dir }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Strip terms**: ${{ github.event.inputs.strip_terms }}" >> $GITHUB_STEP_SUMMARY
           if [ -f foodies_profiles.xlsx ]; then
             python -c "import pandas as pd; df=pd.read_excel('foodies_profiles.xlsx'); print(f'- **New rows scraped this run**: {len(df)}')" >> $GITHUB_STEP_SUMMARY
           else
