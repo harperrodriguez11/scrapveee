@@ -33,28 +33,65 @@ on:
         required: false
         default: ''
         type: string
+      num_jobs:
+        description: 'How many parallel runner jobs (1-7) to race for a working IP. Only one will actually scrape.'
+        required: true
+        default: '3'
+        type: choice
+        options: ['1', '2', '3', '4', '5', '6', '7']
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - name: Build matrix from num_jobs input
+        id: gen
+        run: |
+          N="${{ github.event.inputs.num_jobs }}"
+          ARR="["
+          for i in $(seq 1 "$N"); do
+            if [ "$i" -gt 1 ]; then ARR="${ARR},"; fi
+            ARR="${ARR}${i}"
+          done
+          ARR="${ARR}]"
+          echo "Matrix: $ARR"
+          echo "matrix=$ARR" >> "$GITHUB_OUTPUT"
+
   scrape:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        instance: ${{ fromJson(needs.setup.outputs.matrix) }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      MEGA_DIR: ${{ github.event.inputs.mega_remote_dir }}
+      LOCK_PATH: ${{ github.event.inputs.mega_remote_dir }}/lock/scrape.lock
+      LOCK_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.instance }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Python dependencies
+      # ---------- Step 1: fast reachability probe, no heavy deps yet ----------
+      # If this runner's IP is blocked, fail here and every later step in this
+      # job is skipped automatically — the job stops instantly.
+      - name: "[${{ matrix.instance }}] Quick reachability check (curl)"
+        id: curl_check
         run: |
-          echo "=== Installing Python packages ==="
-          python -m pip install --upgrade pip
-          pip install playwright pandas openpyxl beautifulsoup4 lxml
-          echo "=== Installing Chromium for Playwright ==="
-          playwright install chromium --with-deps
-          echo "=== Dependencies ready ==="
+          URL="${{ github.event.inputs.list_url }}"
+          echo "Probing $URL from this runner ..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 -A \
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" \
+            "$URL" || echo "000")
+          echo "HTTP status: $HTTP_CODE"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::Site not reachable/allowed from this runner's IP (status $HTTP_CODE). Stopping this job."
+            exit 1
+          fi
+          echo "Basic reachability OK, proceeding to browser-level check."
 
       - name: Install rclone
         run: |
@@ -72,16 +109,104 @@ jobs:
           mkdir -p ~/.config/rclone
           printf '%s\n' "$MEGA_RCLONE_CONF" > ~/.config/rclone/rclone.conf
           echo "rclone configured (credentials not printed)"
-          # Sanity check: does rclone accept this config and reach the remote?
           if ! rclone lsd mega: > /tmp/rclone_check.log 2>&1; then
-            echo "::warning::rclone could not list the mega: remote. This usually means the 'pass' value in your secret is a plain password rather than an obscured one."
-            echo "::warning::Fix: run 'rclone obscure YOUR_PASSWORD' locally (or in a scratch Actions step), then replace the 'pass =' line in the MEGA_RCLONE_CONF secret with the obscured output, and re-save the secret."
+            echo "::warning::rclone could not list the mega: remote. Your MEGA_RCLONE_CONF secret's 'pass' value likely needs to be run through 'rclone obscure' first."
             cat /tmp/rclone_check.log
           fi
 
-      - name: Pull existing profiles_urls.txt from Mega (for dedup)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          echo "=== Installing Python packages ==="
+          python -m pip install --upgrade pip
+          pip install playwright pandas openpyxl beautifulsoup4 lxml
+          echo "=== Installing Chromium for Playwright ==="
+          playwright install chromium --with-deps
+          echo "=== Dependencies ready ==="
+
+      # ---------- Step 2: real browser-level reachability check ----------
+      # curl succeeding doesn't guarantee Chromium will — the block you hit
+      # (ERR_HTTP2_PROTOCOL_ERROR) is a browser-level/TLS-fingerprint block,
+      # so this reproduces the exact request the real scrape will make.
+      - name: "[${{ matrix.instance }}] Browser-level reachability check (Playwright)"
+        id: browser_check
         env:
-          MEGA_DIR: ${{ github.event.inputs.mega_remote_dir }}
+          LIST_URL: ${{ github.event.inputs.list_url }}
+        run: |
+          python -u << 'PYEOF'
+          import os, sys
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["LIST_URL"]
+          try:
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(
+                      headless=True,
+                      args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+                  )
+                  ctx = browser.new_context(
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                  )
+                  pg = ctx.new_page()
+                  resp = pg.goto(url, wait_until="domcontentloaded", timeout=20000)
+                  status = resp.status if resp else None
+                  print(f"Browser goto status: {status}")
+                  browser.close()
+                  if not status or status >= 400:
+                      print(f"::error::Browser-level check failed with status {status}")
+                      sys.exit(1)
+          except Exception as e:
+              print(f"::error::Browser-level check raised {type(e).__name__}: {e}")
+              sys.exit(1)
+          print("Browser-level check passed — this runner's IP can reach the site.")
+          PYEOF
+
+      # ---------- Step 3: claim the "who gets to scrape" lock ----------
+      # Best-effort distributed lock on Mega (Mega/rclone has no atomic
+      # compare-and-swap, so this uses jitter + a re-check after a short
+      # delay to make collisions unlikely, not impossible). Losers exit here.
+      - name: "[${{ matrix.instance }}] Claim scrape lock"
+        id: claim_lock
+        run: |
+          JITTER=$(( (${{ matrix.instance }} - 1) * 3 + RANDOM % 4 ))
+          echo "Waiting ${JITTER}s jitter before checking lock (instance ${{ matrix.instance }}) ..."
+          sleep "$JITTER"
+
+          mkdir -p lockcheck
+          LOCK_IS_FRESH="no"
+          if rclone copyto "mega:${LOCK_PATH}" "lockcheck/lock.txt" 2>/tmp/lock_pull.log; then
+            LOCK_AGE_SEC=$(( $(date +%s) - $(date -d "$(rclone lsl "mega:${LOCK_PATH}" | awk '{print $2, $3}')" +%s 2>/dev/null || echo 0) ))
+            LOCK_CONTENT=$(cat lockcheck/lock.txt)
+            echo "Existing lock found: $LOCK_CONTENT (age ~${LOCK_AGE_SEC}s)"
+            if [ "$LOCK_AGE_SEC" -ge 0 ] && [ "$LOCK_AGE_SEC" -lt 1800 ]; then
+              LOCK_IS_FRESH="yes"
+            fi
+          else
+            echo "No existing lock (or couldn't read one) — clear to try claiming."
+          fi
+
+          if [ "$LOCK_IS_FRESH" = "yes" ]; then
+            echo "::error::Another job already claimed the scrape lock recently. Standing down (this is the intended 'close other job' behavior)."
+            exit 1
+          fi
+
+          echo "$LOCK_ID" > lockcheck/mine.txt
+          rclone copyto lockcheck/mine.txt "mega:${LOCK_PATH}"
+          echo "Wrote lock as $LOCK_ID, verifying in 5s ..."
+          sleep 5
+          rclone copyto "mega:${LOCK_PATH}" lockcheck/verify.txt
+          WINNER=$(cat lockcheck/verify.txt)
+          if [ "$WINNER" != "$LOCK_ID" ]; then
+            echo "::error::Lock was overwritten by another job ($WINNER) — lost the race. Standing down."
+            exit 1
+          fi
+          echo "Lock confirmed — this job ($LOCK_ID) will do the scrape. All other matrix instances will stand down."
+
+      - name: Pull existing profiles_urls.txt from Mega (for dedup)
         run: |
           mkdir -p state
           if rclone copyto "mega:${MEGA_DIR}/profiles_urls.txt" "state/profiles_urls.txt" 2>/tmp/rclone_pull.log; then
@@ -122,7 +247,6 @@ jobs:
           parsed = urlparse(LIST_URL)
           BASE_URL = f"{parsed.scheme}://{parsed.netloc}"
 
-          # ---- load already-scraped URLs for dedup ----
           SEEN_URLS_FILE = "state/profiles_urls.txt"
           seen_urls = set()
           if os.path.exists(SEEN_URLS_FILE):
@@ -223,9 +347,6 @@ jobs:
 
               return {"image_url": image_url, "full_name": full_name, "about": about, "profile_url": purl}
 
-          # Some sites inject the display name purely via CSS (e.g. #model-card .card-title::before
-          # { content: "FULL NAME"; }) rather than as HTML text, so BeautifulSoup never sees it.
-          # This reads the actual computed style in the rendered page, the same value a visitor sees on screen.
           CSS_NAME_SELECTORS = [
               "#model-card .card-title",
               ".card-title",
@@ -261,7 +382,7 @@ jobs:
               out = text
               for term in terms:
                   out = re.sub(re.escape(term), "", out, flags=re.IGNORECASE)
-              out = re.sub(r"\s+", " ", out).strip(" \t-–—:,.")
+              out = re.sub(r"\s+", " ", out).strip(" \t-\u2013\u2014:,.")
               return out
 
           async def scrape_one_profile(context, purl, sem, idx, total):
@@ -275,18 +396,16 @@ jobs:
                       await pg.wait_for_timeout(500)
                       html = await pg.content()
                       row = parse_profile(html, purl)
-                      # CSS-injected name takes priority over whatever static HTML parsing found,
-                      # since on this site the real name only exists as a ::before content value.
                       css_name = await get_name_from_css_before(pg)
                       if css_name:
                           row["full_name"] = css_name
                       row["full_name"] = strip_terms_from_text(row["full_name"], STRIP_TERMS)
                       row["about"] = strip_terms_from_text(row["about"], STRIP_TERMS)
                       row_source = "css" if css_name else "html"
-                      log(f" [{idx}/{total}] ✓ {time.time()-t0:.1f}s name({row_source})={row['full_name'][:35]!r} img={bool(row['image_url'])} → {purl}")
+                      log(f" [{idx}/{total}] \u2713 {time.time()-t0:.1f}s name({row_source})={row['full_name'][:35]!r} img={bool(row['image_url'])} \u2192 {purl}")
                       return row
                   except Exception as e:
-                      log(f" [{idx}/{total}] ✗ ERROR {type(e).__name__}: {e} → {purl}")
+                      log(f" [{idx}/{total}] \u2717 ERROR {type(e).__name__}: {e} \u2192 {purl}")
                       return {"image_url": "", "full_name": "", "about": f"ERROR: {e}", "profile_url": purl}
                   finally:
                       await pg.close()
@@ -319,7 +438,7 @@ jobs:
                   while len(new_profile_urls) < MAX_PROFILES:
                       url = build_page_url(LIST_URL, page_num)
                       log("-" * 50)
-                      log(f"LIST PAGE {page_num} → {url}")
+                      log(f"LIST PAGE {page_num} \u2192 {url}")
                       try:
                           await list_page.goto(url, wait_until="domcontentloaded", timeout=60000)
                           await list_page.wait_for_timeout(1500)
@@ -329,13 +448,13 @@ jobs:
                           await list_page.wait_for_timeout(1000)
                           html = await list_page.content()
                       except Exception as e:
-                          log(f" ✗ ERROR on list page {page_num}: {type(e).__name__}: {e}")
+                          log(f" \u2717 ERROR on list page {page_num}: {type(e).__name__}: {e}")
                           break
 
                       soup, title, links, tag = extract_links(html)
                       log(f" title={title!r} selector='{tag}' found={len(links)}")
                       if not links:
-                          log(" No links found on this page → stopping pagination")
+                          log(" No links found on this page \u2192 stopping pagination")
                           break
 
                       page_batch = []
@@ -380,18 +499,17 @@ jobs:
                   await browser.close()
 
               log("=" * 60)
-              log(f"SCRAPE FINISHED → {len(results)} new profiles")
+              log(f"SCRAPE FINISHED \u2192 {len(results)} new profiles")
               log("=" * 60)
 
               df = pd.DataFrame(results, columns=["image_url", "full_name", "about", "profile_url"])
               df.to_excel("foodies_profiles.xlsx", index=False, engine="openpyxl")
               log(f"Saved foodies_profiles.xlsx ({len(df)} rows)")
 
-              # append newly scraped urls to the dedup file
               with open(SEEN_URLS_FILE, "a", encoding="utf-8") as f:
                   for u in new_profile_urls:
                       f.write(u + "\n")
-              log(f"Updated {SEEN_URLS_FILE} → now {len(seen_urls)} total known URLs")
+              log(f"Updated {SEEN_URLS_FILE} \u2192 now {len(seen_urls)} total known URLs")
 
               if not df.empty:
                   print(df.head(5).to_string(), flush=True)
@@ -402,7 +520,7 @@ jobs:
       - name: Upload XLSX artifact (GitHub, 30-day retention)
         uses: actions/upload-artifact@v4
         with:
-          name: foodies-profiles
+          name: foodies-profiles-instance-${{ matrix.instance }}
           path: |
             foodies_profiles.xlsx
             state/profiles_urls.txt
@@ -410,8 +528,6 @@ jobs:
           if-no-files-found: warn
 
       - name: Push results to Mega (overwrite existing files)
-        env:
-          MEGA_DIR: ${{ github.event.inputs.mega_remote_dir }}
         run: |
           TS=$(date +%Y%m%d_%H%M%S)
           if [ -f foodies_profiles.xlsx ]; then
@@ -424,19 +540,28 @@ jobs:
             echo "Uploaded updated profiles_urls.txt to Mega (overwritten)"
           fi
 
-      - name: Summary
+      # ---------- Step 4: release the lock so the NEXT run isn't blocked ----------
+      - name: Release scrape lock
+        if: always() && steps.claim_lock.outcome == 'success'
         run: |
-          echo "### Scrape complete" >> $GITHUB_STEP_SUMMARY
+          rclone deletefile "mega:${LOCK_PATH}" 2>/dev/null || true
+          echo "Lock released."
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Instance ${{ matrix.instance }} summary" >> $GITHUB_STEP_SUMMARY
           echo "- **URL**: ${{ github.event.inputs.list_url }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Max new profiles requested**: ${{ github.event.inputs.max_profiles }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Start page**: ${{ github.event.inputs.start_page }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Concurrency**: ${{ github.event.inputs.concurrency }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Mega folder**: ${{ github.event.inputs.mega_remote_dir }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Strip terms**: ${{ github.event.inputs.strip_terms }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Parallel jobs raced**: ${{ github.event.inputs.num_jobs }}" >> $GITHUB_STEP_SUMMARY
           if [ -f foodies_profiles.xlsx ]; then
             python -c "import pandas as pd; df=pd.read_excel('foodies_profiles.xlsx'); print(f'- **New rows scraped this run**: {len(df)}')" >> $GITHUB_STEP_SUMMARY
           else
-            echo "- **No file produced**" >> $GITHUB_STEP_SUMMARY
+            echo "- **This instance did not scrape** (blocked, or lost the lock race)" >> $GITHUB_STEP_SUMMARY
           fi
           if [ -f state/profiles_urls.txt ]; then
             echo "- **Total known profile URLs (all-time)**: $(wc -l < state/profiles_urls.txt)" >> $GITHUB_STEP_SUMMARY
