@@ -1,4 +1,4 @@
-name: Scrape Foodies Profiles Claude
+name: Scrape Foodies Profiles
 
 on:
   workflow_dispatch:
@@ -56,24 +56,23 @@ jobs:
           curl https://rclone.org/install.sh | sudo bash
           rclone version
 
-      - name: Configure rclone for Mega (from secrets, obscured at runtime)
+      - name: Configure rclone for Mega (from secret)
         env:
-          MEGA_USER: ${{ secrets.MEGA_USER }}
-          MEGA_PASS: ${{ secrets.MEGA_PASS }}
+          MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
         run: |
-          if [ -z "$MEGA_USER" ] || [ -z "$MEGA_PASS" ]; then
-            echo "::error::MEGA_USER / MEGA_PASS secrets are not set. Add them under Settings > Secrets and variables > Actions."
+          if [ -z "$MEGA_RCLONE_CONF" ]; then
+            echo "::error::MEGA_RCLONE_CONF secret is not set. Add it under Settings > Secrets and variables > Actions, containing your full rclone.conf [mega] block."
             exit 1
           fi
           mkdir -p ~/.config/rclone
-          OBSCURED_PASS=$(rclone obscure "$MEGA_PASS")
-          cat > ~/.config/rclone/rclone.conf << EOF
-          [mega]
-          type = mega
-          user = ${MEGA_USER}
-          pass = ${OBSCURED_PASS}
-          EOF
+          printf '%s\n' "$MEGA_RCLONE_CONF" > ~/.config/rclone/rclone.conf
           echo "rclone configured (credentials not printed)"
+          # Sanity check: does rclone accept this config and reach the remote?
+          if ! rclone lsd mega: > /tmp/rclone_check.log 2>&1; then
+            echo "::warning::rclone could not list the mega: remote. This usually means the 'pass' value in your secret is a plain password rather than an obscured one."
+            echo "::warning::Fix: run 'rclone obscure YOUR_PASSWORD' locally (or in a scratch Actions step), then replace the 'pass =' line in the MEGA_RCLONE_CONF secret with the obscured output, and re-save the secret."
+            cat /tmp/rclone_check.log
+          fi
 
       - name: Pull existing profiles_urls.txt from Mega (for dedup)
         env:
