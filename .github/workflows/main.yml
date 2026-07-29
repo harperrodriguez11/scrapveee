@@ -87,7 +87,6 @@
               context.add_init_script(STEALTH_SCRIPT)
               return browser, context, context.new_page()
 
-          # ---------- diagnostics ----------
           log("=" * 60)
           log("URL & NETWORK DIAGNOSTICS")
           log("=" * 60)
@@ -110,7 +109,7 @@
           host = parsed.netloc.split(":")[0]
           try:
               ips = sorted({item[4][0] for item in socket.getaddrinfo(host, None)})
-              log(f" DNS OK → {host} → {', '.join(ips)}")
+              log(f" DNS OK -> {host} -> {', '.join(ips)}")
           except socket.gaierror as e:
               log(f" DNS FAILED: {e}")
               raise SystemExit(1)
@@ -124,7 +123,6 @@
                   qs["page"] = [str(page_num)]
               return urlunparse((p.scheme, p.netloc, p.path or "/", p.params, urlencode(qs, doseq=True), p.fragment))
 
-          # ---------- known image urls ----------
           known_image_urls = set()
           if IMAGE_URLS_FILE.exists():
               with open(IMAGE_URLS_FILE, encoding="utf-8") as f:
@@ -137,7 +135,6 @@
           known_urls_lock = threading.Lock()
           save_lock = threading.Lock()
 
-          # ---------- load existing excel (3 columns only) ----------
           if XLSX_FILE.exists():
               try:
                   book = load_workbook(XLSX_FILE, read_only=True)
@@ -150,7 +147,7 @@
                       existing_df = existing_df.drop(columns=["profile_url"])
                   existing_df = existing_df.reindex(columns=COLUMNS)
               except Exception as e:
-                  log(f" Could not read existing xlsx ({e}) — starting fresh")
+                  log(f" Could not read existing xlsx ({e}) - starting fresh")
                   existing_df = pd.DataFrame(columns=COLUMNS)
           else:
               existing_df = pd.DataFrame(columns=COLUMNS)
@@ -172,11 +169,8 @@
                       shutil.copy(XLSX_FILE, OUT_XLSX)
                   except Exception as e:
                       log(f" Checkpoint write error: {e}")
-                  log(f" CHECKPOINT ({reason}) → +{len(results_batch)} rows, total {len(combined)}")
+                  log(f" CHECKPOINT ({reason}) -> +{len(results_batch)} rows, total {len(combined)}")
 
-          # ============================================================
-          # PHASE 1 – list pages → collect profile URLs only
-          # ============================================================
           profile_urls = []
           seen_ids = set()
           page = START_PAGE
@@ -186,7 +180,7 @@
               return (not SCRAPE_ALL_PER_PAGE) and len(profile_urls) >= MAX_PROFILES
 
           log("=" * 60)
-          log("PHASE 1: list pages → collect profile URLs")
+          log("PHASE 1: list pages -> collect profile URLs")
           log("=" * 60)
 
           with sync_playwright() as p:
@@ -196,17 +190,17 @@
               while not cap_reached():
                   url = build_page_url(LIST_URL, page)
                   log("-" * 50)
-                  log(f"LIST PAGE {page} → {url}")
+                  log(f"LIST PAGE {page} -> {url}")
                   log(f" collected so far: {len(profile_urls)}" + ("" if SCRAPE_ALL_PER_PAGE else f" / {MAX_PROFILES}"))
 
                   success = False
                   last_error = None
                   for attempt in range(1, MAX_RETRIES_PER_PAGE + 1):
                       try:
-                          log(f" → goto attempt {attempt}/{MAX_RETRIES_PER_PAGE}")
+                          log(f" -> goto attempt {attempt}/{MAX_RETRIES_PER_PAGE}")
                           t0 = time.time()
                           resp = page_obj.goto(url, wait_until="domcontentloaded", timeout=60000)
-                          log(f" → done in {time.time()-t0:.1f}s | status={resp.status if resp else 'N/A'}")
+                          log(f" -> done in {time.time()-t0:.1f}s | status={resp.status if resp else 'N/A'}")
                           if resp and resp.status >= 400:
                               last_error = f"HTTP {resp.status}"
                               if attempt < MAX_RETRIES_PER_PAGE:
@@ -216,15 +210,15 @@
                           page_obj.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                           page_obj.wait_for_timeout(PAGE_WAIT_MS)
                           html = page_obj.content()
-                          log(f" → HTML length: {len(html)}")
+                          log(f" -> HTML length: {len(html)}")
                           success = True
                           break
                       except PlaywrightTimeout as e:
                           last_error = f"Timeout: {e}"
-                          log(f" ✗ attempt {attempt} TIMEOUT")
+                          log(f" X attempt {attempt} TIMEOUT")
                       except Exception as e:
                           last_error = f"{type(e).__name__}: {e}"
-                          log(f" ✗ attempt {attempt} failed: {last_error}")
+                          log(f" X attempt {attempt} failed: {last_error}")
                       if attempt < MAX_RETRIES_PER_PAGE:
                           time.sleep(2 * attempt)
 
@@ -241,16 +235,16 @@
                   log(f" Page title: {title}")
 
                   links = soup.select("div.grid_item a[href*='/profile/']")
-                  log(f" selector grid_item → {len(links)}")
+                  log(f" selector grid_item -> {len(links)}")
                   if not links:
                       links = soup.select("a[href*='/profile/?id=']")
-                      log(f" fallback /profile/?id= → {len(links)}")
+                      log(f" fallback /profile/?id= -> {len(links)}")
                   if not links:
                       links = soup.select("a[data-slug]")
-                      log(f" fallback data-slug → {len(links)}")
+                      log(f" fallback data-slug -> {len(links)}")
                   if not links:
                       links = soup.select("a[href*='profile']")
-                      log(f" fallback profile → {len(links)}")
+                      log(f" fallback profile -> {len(links)}")
 
                   if not links:
                       empty_pages_streak += 1
@@ -277,7 +271,7 @@
                       if new <= 5 or new % 10 == 0:
                           log(f" + profile URL [{len(profile_urls)}]: {full}")
 
-                  log(f" Added {new} → total unique: {len(profile_urls)}")
+                  log(f" Added {new} -> total unique: {len(profile_urls)}")
                   if new == 0:
                       empty_pages_streak += 1
                       if empty_pages_streak >= MAX_EMPTY_STREAK:
@@ -306,13 +300,10 @@
                   time.sleep(0.3)
 
               log("=" * 60)
-              log(f"PHASE 1 DONE → {len(profile_urls)} profile URLs collected")
+              log(f"PHASE 1 DONE -> {len(profile_urls)} profile URLs collected")
               log("=" * 60)
               browser.close()
 
-          # ============================================================
-          # PHASE 2 – open every profile URL and scrape image / name / about
-          # ============================================================
           extraction_stats = {"name": 0, "about": 0, "image": 0, "total": 0}
           stats_lock = threading.Lock()
           debug_html_saved = threading.Event()
@@ -321,7 +312,6 @@
           def extract_profile(soup, html):
               image_url = ""
               full_name = ""
-
               img_el = soup.select_one("div.card-image img")
               if img_el:
                   src = img_el.get("src") or img_el.get("data-src") or img_el.get("data-lazy-src") or ""
@@ -330,7 +320,6 @@
                   alt = (img_el.get("alt") or "").strip()
                   if alt:
                       full_name = alt
-
               if not full_name:
                   m = re.search(
                       r"\.card-title\s*:{1,2}\s*before\s*\{[^}]*content\s*:\s*[\"']([^\"']+)[\"']",
@@ -340,17 +329,14 @@
                       raw = m.group(1).strip()
                       name_m = re.match(r"^(.+?)'s\b", raw)
                       full_name = name_m.group(1).strip() if name_m else raw
-
               if not full_name and soup.title:
                   t = (soup.title.string or "").strip()
                   if t and t.lower() not in GENERIC_TITLES:
                       full_name = t.split("|")[0].split("-")[0].strip()
-
               if not image_url:
                   m_img = re.search(r'https?://img\.foodies\.com/[^\s"\'<>]+', html)
                   if m_img:
                       image_url = m_img.group(0)
-
               about = ""
               desc_p = soup.select_one("div.desc p")
               if desc_p:
@@ -360,7 +346,6 @@
                   if desc_container:
                       about = desc_container.get_text(" ", strip=True)
               about = re.sub(r"^About:\s*", "", about, flags=re.I).strip()
-
               if not about:
                   for subtitle in soup.find_all(string=re.compile(r"^\s*About:?\s*$", re.I)):
                       parent = subtitle.parent
@@ -368,13 +353,11 @@
                       if candidate:
                           about = candidate.get_text(" ", strip=True)
                           break
-
               if not about:
                   text = soup.get_text(" ", strip=True)
                   m2 = re.search(r"About:\s*(.{1,400}?)(?:\s{2,}|$)", text)
                   if m2:
                       about = m2.group(1).strip()
-
               return full_name, about, image_url
 
           def worker_scrape(chunk, worker_id):
@@ -382,17 +365,14 @@
               local_dups = 0
               if not chunk:
                   return local_results, local_dups
-
               with sync_playwright() as p:
                   browser, context, page_obj = new_stealth_page(p)
-                  log(f"[W{worker_id}] browser ready – {len(chunk)} profiles")
+                  log(f"[W{worker_id}] browser ready - {len(chunk)} profiles")
                   since_last_checkpoint = 0
-
                   for i, purl in enumerate(chunk, 1):
-                      log(f"[W{worker_id}] {i}/{len(chunk)} → OPEN {purl}")
+                      log(f"[W{worker_id}] {i}/{len(chunk)} -> OPEN {purl}")
                       html = ""
                       load_error = None
-
                       for load_attempt in range(1, 3):
                           try:
                               t0 = time.time()
@@ -403,38 +383,33 @@
                               except PlaywrightTimeout:
                                   pass
                               page_obj.evaluate("window.scrollTo(0, 400)")
-
                               img_ready = desc_ready = True
                               try:
                                   page_obj.wait_for_selector("div.card-image img[src]", timeout=15000)
                               except PlaywrightTimeout:
                                   img_ready = False
-                                  log(f"[W{worker_id}] ⚠ card-image not ready")
+                                  log(f"[W{worker_id}] card-image not ready")
                               try:
                                   page_obj.wait_for_selector("div.desc p, div.desc", timeout=10000)
                               except PlaywrightTimeout:
                                   desc_ready = False
-                                  log(f"[W{worker_id}] ⚠ desc not ready")
-
+                                  log(f"[W{worker_id}] desc not ready")
                               if not (img_ready and desc_ready) and load_attempt == 1:
-                                  log(f"[W{worker_id}] reload once …")
+                                  log(f"[W{worker_id}] reload once")
                                   continue
-
                               page_obj.wait_for_timeout(PROFILE_WAIT_MS)
                               html = page_obj.content()
                               load_error = None
                               break
                           except Exception as e:
                               load_error = e
-                              log(f"[W{worker_id}] ✗ load {load_attempt}: {type(e).__name__}: {e}")
+                              log(f"[W{worker_id}] X load {load_attempt}: {type(e).__name__}: {e}")
                               if load_attempt < 2:
                                   time.sleep(2)
-
                       if load_error is not None or not html:
-                          log(f"[W{worker_id}] ✗ ERROR after retries: {load_error}")
+                          log(f"[W{worker_id}] X ERROR after retries: {load_error}")
                           local_results.append({"image_url": "", "full_name": "", "about": f"ERROR: {load_error}"})
                           continue
-
                       if not debug_html_saved.is_set():
                           try:
                               DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -443,35 +418,29 @@
                               debug_html_saved.set()
                           except Exception:
                               pass
-
                       soup = BeautifulSoup(html, "lxml")
                       full_name, about, image_url = extract_profile(soup, html)
-
                       with stats_lock:
                           extraction_stats["total"] += 1
                           if full_name: extraction_stats["name"] += 1
                           if about: extraction_stats["about"] += 1
                           if image_url: extraction_stats["image"] += 1
-
                       if image_url:
                           with known_urls_lock:
                               if image_url in known_image_urls:
                                   local_dups += 1
                                   continue
                               known_image_urls.add(image_url)
-
                       local_results.append({
                           "image_url": image_url,
                           "full_name": full_name,
                           "about": about,
                       })
                       since_last_checkpoint += 1
-                      log(f"[W{worker_id}] ✓ name={full_name[:40]!r} | img={bool(image_url)} | about_len={len(about)}")
-
+                      log(f"[W{worker_id}] OK name={full_name[:40]!r} | img={bool(image_url)} | about_len={len(about)}")
                       if since_last_checkpoint >= CHECKPOINT_EVERY:
                           save_checkpoint(local_results[-since_last_checkpoint:], reason=f"W{worker_id} +{since_last_checkpoint}")
                           since_last_checkpoint = 0
-
                   if since_last_checkpoint > 0:
                       save_checkpoint(local_results[-since_last_checkpoint:], reason=f"W{worker_id} final")
                   browser.close()
@@ -491,7 +460,6 @@
               log("=" * 60)
               log(f"PHASE 2: open each profile page ({workers_needed} workers)")
               log("=" * 60)
-
               chunks = chunk_list(profile_urls, workers_needed)
               total_dups = 0
               try:
@@ -504,14 +472,12 @@
                           total_dups += chunk_dups
               except Exception as e:
                   log(f" Phase 2 crashed: {type(e).__name__}: {e}")
-
-              log(f"PHASE 2 DONE → {len(results)} new, {total_dups} dups skipped")
+              log(f"PHASE 2 DONE -> {len(results)} new, {total_dups} dups skipped")
               if extraction_stats["total"]:
                   log(f" hit-rate name={extraction_stats['name']}/{extraction_stats['total']} "
                       f"about={extraction_stats['about']}/{extraction_stats['total']} "
                       f"image={extraction_stats['image']}/{extraction_stats['total']}")
 
-          # ---------- final write ----------
           DATA_DIR.mkdir(parents=True, exist_ok=True)
           with open(IMAGE_URLS_FILE, "w", encoding="utf-8") as f:
               for u in sorted(known_image_urls):
@@ -523,14 +489,14 @@
               final_df = final_df.drop_duplicates(subset=["image_url"], keep="first")
               final_df.to_excel(XLSX_FILE, sheet_name=SHEET_NAME, index=False, engine="openpyxl")
               shutil.copy(XLSX_FILE, OUT_XLSX)
-              log(f"Final → sheet '{SHEET_NAME}' has {len(final_df)} rows")
+              log(f"Final -> sheet '{SHEET_NAME}' has {len(final_df)} rows")
           elif XLSX_FILE.exists():
               shutil.copy(XLSX_FILE, OUT_XLSX)
-              log(f"No new rows → sheet stays at {len(existing_df)} rows")
+              log(f"No new rows -> sheet stays at {len(existing_df)} rows")
           else:
               log("No xlsx created")
 
           log("=" * 60)
-          log(f"SCRAPE FINISHED → {len(results)} new profiles")
+          log(f"SCRAPE FINISHED -> {len(results)} new profiles")
           log("=" * 60)
           PYEOF
